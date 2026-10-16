@@ -1,10 +1,16 @@
+# Roleplay files (ignored)
+aethel-roleplay/
+HOST_AETHEL.bat
+Iniciar_Aethel_Roleplay.bat
+__pycache__/
+scratch/
+
 # Logs
 *.log
 addons/counterstrikesharp/logs/*
 !addons/counterstrikesharp/logs/.gitkeep
 
 # Temp / Cache
-__pycache__/
 *.tmp
 *.bak
 *.bak_preupdate
