@@ -1,0 +1,12 @@
+# Logs
+*.log
+addons/counterstrikesharp/logs/*
+!addons/counterstrikesharp/logs/.gitkeep
+
+# Temp / Cache
+__pycache__/
+*.tmp
+*.bak
+*.bak_preupdate
+.DS_Store
+Thumbs.db
