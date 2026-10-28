@@ -2,7 +2,7 @@
   "CCSBot::EquipBestWeapon": {
     "signatures": {
       "library": "server",
-      "windows": "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B F9 84 D2",
+      "windows": "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B D9 84 D2",
       "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 89 FB 48 83 EC ? 40 84 F6 75 ? F3 0F 10 8F ? ? ? ?"
     },
     "comment": "bot picks and equips its best weapon."
@@ -10,7 +10,7 @@
   "CCSBot::EquipPistol": {
     "signatures": {
       "library": "server",
-      "windows": "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B D9 84 D2",
+      "windows": "48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 48 8B 41 18 0F B6 FA 48 8B D9",
       "linux": "55 48 89 E5 53 48 89 FB 48 83 EC ? 40 84 F6 75 ? F3 0F 10 8F ? ? ? ? 66 0F EF C0 0F 2F C8"
     },
     "comment": "bot switches to its pistol secondary"
@@ -18,7 +18,7 @@
   "CCSPlayer_WeaponServices::SelectItem": {
     "signatures": {
       "library": "server",
-      "windows": "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 48 83 EC ? 41 8B E8 48 8B DA 48 8B F1",
+      "windows": "48 89 5C 24 ? 48 89 6C 24 ? 48 89 74 24 ? 57 41 56 41 57 48 83 EC ? 45 33 FF 4C 8B F2 48 8B",
       "linux": "55 48 89 E5 41 57 41 56 41 55 49 89 F5 41 54 53 48 89 FB 48 81 EC ? ? ? ? 48 8B 7F 38 48 85 FF"
     },
     "comment": "Funnel for any weapon switch"
@@ -58,7 +58,7 @@
   "BuyState::OnUpdate": {
     "signatures": {
       "library": "server",
-      "windows": "48 89 54 24 ? 48 89 4C 24 ? 55 57 41 54 48 8D AC 24",
+      "windows": "48 89 54 24 ? 48 89 4C 24 ? 55 53 41 55 48 8D AC 24",
       "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 FC 53 48 89 F3 48 81 EC ? ? ? ? 80 7F 08 00 74"
     },
     "comment": "Bot buy state per-tick ordering; issues buy commands"
@@ -80,7 +80,7 @@
   "CCSBot::UpdateLookAngles": {
     "signatures": {
       "library": "server",
-      "windows": "40 55 53 56 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? 48 8D 05",
+      "windows": "40 55 53 56 41 56 48 8D 6C 24 ? 48 81 EC ? ? ? ? 48 8D 05",
       "linux": "55 48 8D 05 ? ? ? ? 48 8D 35 ? ? ? ? 48 89 E5 41 55 4C 8D 6D C0 41 54 53 4C 89 EA 48 89 FB 48 8D 3D"
     },
     "comment": "Spring-smooths view to m_lookPitch/m_lookYaw"
@@ -88,7 +88,7 @@
   "CCSPlayerPawn::SetEyeAngles": {
     "signatures": {
       "library": "server",
-      "windows": "48 89 5C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 55 48 8D 6C 24 ? 48 81 EC ? ? ? ? 48 8B DA 48 8B F1 48 8D 55",
+      "windows": "48 89 5C 24 ? 48 89 74 24 ? 48 89 7C 24 ? 4C 89 64 24 ? 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC",
       "linux": "55 48 89 E5 41 57 49 89 FF 48 89 F7 41 56 41 55 41 54 53 48 81 EC ? ? ? ? E8 ? ? ? ? 49 8B 8F"
     },
     "comment": "Engine eye-angle"
@@ -279,56 +279,56 @@
   },
   "CCSPlayerPawn::WeaponServices": {
     "offsets": {
-      "windows": 2608,
+      "windows": 2832,
       "linux": 3296
     },
     "comment": "m_pWeaponServices"
   },
   "CBasePlayerPawn::MovementServices": {
     "offsets": {
-      "windows": 2672,
+      "windows": 2896,
       "linux": 0
     },
     "comment": "m_pMovementServices"
   },
   "CCSPlayerPawn::Controller": {
     "offsets": {
-      "windows": 2992,
+      "windows": 3224,
       "linux": 3680
     },
     "comment": "m_hController"
   },
   "CCSPlayerPawn::OriginalController": {
     "offsets": {
-      "windows": 3364,
+      "windows": 3604,
       "linux": 4044
     },
     "comment": "m_hOriginalController"
   },
   "CCSPlayerPawn::ViewAngle": {
     "offsets": {
-      "windows": 2792,
+      "windows": 3016,
       "linux": 3480
     },
     "comment": "v_angle"
   },
   "CCSPlayerPawn::ViewAnglePrevious": {
     "offsets": {
-      "windows": 2804,
+      "windows": 3028,
       "linux": 0
     },
     "comment": "v_anglePrevious"
   },
   "CCSPlayerPawn::ServerViewAngleChanges": {
     "offsets": {
-      "windows": 2688,
+      "windows": 2912,
       "linux": 0
     },
     "comment": "m_ServerViewAngleChanges"
   },
   "CCSPlayerPawn::EyeAngles": {
     "offsets": {
-      "windows": 4968,
+      "windows": 5556,
       "linux": 5648
     },
     "comment": "m_angEyeAngles"
@@ -342,7 +342,7 @@
   },
   "CBasePlayerWeapon::ItemDefIndex": {
     "offsets": {
-      "windows": 2560,
+      "windows": 2784,
       "linux": 3264
     },
     "comment": "m_iItemDefinitionIndex"

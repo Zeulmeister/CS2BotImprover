@@ -10,6 +10,10 @@ scratch/
 addons/counterstrikesharp/logs/*
 !addons/counterstrikesharp/logs/.gitkeep
 
+# Build output folders inside plugins (keep release DLLs at plugin root)
+addons/counterstrikesharp/plugins/*/bin/
+addons/counterstrikesharp/plugins/*/obj/
+
 # Temp / Cache
 *.tmp
 *.bak

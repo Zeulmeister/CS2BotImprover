@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Optimize>true</Optimize>
+    <AssemblyName>RayTraceImpl</AssemblyName>
+    <RootNamespace>RayTraceImpl</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="CounterStrikeSharp.API">
+      <HintPath>..\..\api\CounterStrikeSharp.API.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="RayTraceApi">
+      <HintPath>..\..\shared\RayTraceApi\RayTraceApi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
+

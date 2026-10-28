@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="CounterStrikeSharp.API">
+      <HintPath>..\..\api\CounterStrikeSharp.API.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="BotControllerApi">
+      <HintPath>..\..\shared\BotControllerApi\BotControllerApi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="RayTraceApi">
+      <HintPath>..\..\shared\RayTraceApi\RayTraceApi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Logging.Abstractions">
+      <HintPath>..\..\api\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Microsoft.Extensions.Logging">
+      <HintPath>..\..\api\Microsoft.Extensions.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
