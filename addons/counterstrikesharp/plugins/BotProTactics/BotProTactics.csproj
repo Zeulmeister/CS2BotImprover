@@ -4,7 +4,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="BotProTactics.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <Reference Include="CounterStrikeSharp.API">

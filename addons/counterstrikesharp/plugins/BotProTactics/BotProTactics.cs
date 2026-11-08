@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
@@ -149,6 +150,11 @@ namespace BotProTactics
         public bool IsAnchoredOnSightline;
         public float AnchoredYaw;
         public bool FakeDefuseDone;
+        public bool IsC4Carrier;
+        public float RetakeStagingUntilSec;
+
+        // Objective & anchor timers
+        public float BombDefuseAlertUntilSec;
 
         // RayTrace cached clearance & corridor pre-aim
         public bool CanStrafeLeft = true;
@@ -189,6 +195,9 @@ namespace BotProTactics
             HoldUntilSec = 0f;
             IsAnchoredOnSightline = false;
             FakeDefuseDone = false;
+            IsC4Carrier = false;
+            RetakeStagingUntilSec = 0f;
+            BombDefuseAlertUntilSec = 0f;
             CanStrafeLeft = true;
             CanStrafeRight = true;
             CanMoveBack = true;
@@ -199,15 +208,29 @@ namespace BotProTactics
     }
 
     // =========================================================================
-    // 2. MAIN PLUGIN: BOTPROTATICS v3.1.0 (UTILITY AI + RAYTRACE SUBTICK ENGINE)
+    // 2. MAIN PLUGIN: BOTPROTATICS v3.3.0 (UTILITY AI + RAYTRACE SUBTICK ENGINE)
     // =========================================================================
 
     public class BotProTacticsPlugin : BasePlugin
     {
         public override string ModuleName => "BotProTactics";
-        public override string ModuleVersion => "3.2.0";
+        public override string ModuleVersion => "3.3.0";
         public override string ModuleAuthor => "Antigravity & ed0ard";
-        public override string ModuleDescription => "Tier 1 Utility AI + HFSM, Team Radar Callouts, Anti-Backwards-Run Navigation & Biomechanical Aim";
+        public override string ModuleDescription => "Tier 1 Utility AI + HFSM, Slot64 Scan, Planted Burst Discipline & Biomechanical Aim";
+
+        private static readonly FieldInfo? _serverMaxPlayersField =
+            typeof(Server).GetField("_maxPlayers", BindingFlags.NonPublic | BindingFlags.Static);
+
+        private static void ResetServerMaxPlayersCache()
+        {
+            try
+            {
+                _serverMaxPlayersField?.SetValue(null, null);
+            }
+            catch
+            {
+            }
+        }
 
         // Source 2 Usercmd Button Constants
         public const ulong IN_ATTACK = 1UL;
@@ -265,9 +288,204 @@ namespace BotProTactics
         public bool EnableFakeDefuse = true;
         public bool EnableTradeFrags = true;
         public bool EnableTeamCallouts = true;
+        public bool EnableIglVirtual = true;
+
+        // Virtual IGL tactical state
+        private int _consecutiveTLosses = 0;
+        private int _consecutiveCTLosses = 0;
+        private string _targetBombsite = "A";
+        private Vector _siteAPos = new Vector(-300f, -1600f, -160f);
+        private Vector _siteBPos = new Vector(-1100f, 400f, -160f);
+        private Vector _tSpawnCenter = new Vector(0f, 0f, 0f);
+        private Vector _ctSpawnCenter = new Vector(0f, 0f, 0f);
+        private bool _spawnsResolved = false;
+        private float _freezeEndTime = 0f;
+        private string _botChallengeMode = "hard";
+        private CsTeam _cachedHumanTeam = CsTeam.None;
+
+        private void ResolveMapBombsites()
+        {
+            try
+            {
+                var resource = Utilities.FindAllEntitiesByDesignerName<CCSPlayerResource>("cs_player_manager").FirstOrDefault();
+                if (resource != null && resource.IsValid)
+                {
+                    Vector? centerA = resource.BombsiteCenterA;
+                    Vector? centerB = resource.BombsiteCenterB;
+                    if (centerA != null && centerB != null &&
+                        (MathF.Abs(centerA.X) > 1f || MathF.Abs(centerA.Y) > 1f) &&
+                        (MathF.Abs(centerB.X) > 1f || MathF.Abs(centerB.Y) > 1f))
+                    {
+                        _siteAPos = new Vector(centerA.X, centerA.Y, centerA.Z);
+                        _siteBPos = new Vector(centerB.X, centerB.Y, centerB.Z);
+                        return;
+                    }
+                }
+
+                string map = (Server.MapName ?? "").ToLowerInvariant();
+                if (map.Contains("mirage"))
+                {
+                    _siteAPos = new Vector(-510f, -1950f, -160f);
+                    _siteBPos = new Vector(-1960f, 350f, -160f);
+                }
+                else if (map.Contains("inferno"))
+                {
+                    _siteAPos = new Vector(1880f, 340f, 160f);
+                    _siteBPos = new Vector(480f, 2650f, 160f);
+                }
+                else if (map.Contains("dust2"))
+                {
+                    _siteAPos = new Vector(1150f, 2480f, 96f);
+                    _siteBPos = new Vector(-1550f, 2620f, 32f);
+                }
+                else if (map.Contains("anubis"))
+                {
+                    _siteAPos = new Vector(920f, 2100f, 64f);
+                    _siteBPos = new Vector(-980f, 1520f, 32f);
+                }
+                else if (map.Contains("ancient"))
+                {
+                    _siteAPos = new Vector(-2060f, 880f, 96f);
+                    _siteBPos = new Vector(860f, 880f, 96f);
+                }
+                else if (map.Contains("nuke"))
+                {
+                    _siteAPos = new Vector(620f, -1040f, -416f);
+                    _siteBPos = new Vector(620f, -1040f, -768f);
+                }
+            }
+            catch { }
+        }
+
+        private void ResolveMapSpawns()
+        {
+            _cachedHumanTeam = GetHumanTeam();
+            _spawnsResolved = false;
+            try
+            {
+                float tx = 0, ty = 0, tz = 0;
+                int tCount = 0;
+                float cx = 0, cy = 0, cz = 0;
+                int ctCount = 0;
+
+                // At RoundStart / FreezeEnd, living players are standing directly on their team's spawn pads!
+                for (int s = 0; s < 64; s++)
+                {
+                    var p = Utilities.GetPlayerFromSlot(s);
+                    if (p == null || !p.IsValid || !p.PawnIsAlive) continue;
+                    var pawn = p.PlayerPawn?.Value;
+                    if (pawn?.AbsOrigin == null) continue;
+                    if (p.Team == CsTeam.Terrorist)
+                    {
+                        tx += pawn.AbsOrigin.X; ty += pawn.AbsOrigin.Y; tz += pawn.AbsOrigin.Z;
+                        tCount++;
+                    }
+                    else if (p.Team == CsTeam.CounterTerrorist)
+                    {
+                        cx += pawn.AbsOrigin.X; cy += pawn.AbsOrigin.Y; cz += pawn.AbsOrigin.Z;
+                        ctCount++;
+                    }
+                }
+
+                if (tCount > 0 && ctCount > 0)
+                {
+                    _tSpawnCenter = new Vector(tx / tCount, ty / tCount, tz / tCount);
+                    _ctSpawnCenter = new Vector(cx / ctCount, cy / ctCount, cz / ctCount);
+                    _spawnsResolved = true;
+                    return;
+                }
+
+                var tSpawns = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("info_player_terrorist").ToList();
+                var ctSpawns = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("info_player_counterterrorist").ToList();
+
+                if (tSpawns.Count > 0 && ctSpawns.Count > 0)
+                {
+                    tx = 0; ty = 0; tz = 0;
+                    foreach (var s in tSpawns)
+                    {
+                        if (s.AbsOrigin != null) { tx += s.AbsOrigin.X; ty += s.AbsOrigin.Y; tz += s.AbsOrigin.Z; }
+                    }
+                    _tSpawnCenter = new Vector(tx / tSpawns.Count, ty / tSpawns.Count, tz / tSpawns.Count);
+
+                    cx = 0; cy = 0; cz = 0;
+                    foreach (var s in ctSpawns)
+                    {
+                        if (s.AbsOrigin != null) { cx += s.AbsOrigin.X; cy += s.AbsOrigin.Y; cz += s.AbsOrigin.Z; }
+                    }
+                    _ctSpawnCenter = new Vector(cx / ctSpawns.Count, cy / ctSpawns.Count, cz / ctSpawns.Count);
+                    _spawnsResolved = true;
+                    return;
+                }
+            }
+            catch { }
+
+            string map = (Server.MapName ?? "").ToLowerInvariant();
+            if (map.Contains("mirage"))
+            {
+                _tSpawnCenter = new Vector(1200f, -200f, -100f);
+                _ctSpawnCenter = new Vector(-1680f, -1950f, -160f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("inferno"))
+            {
+                _tSpawnCenter = new Vector(-1800f, 380f, 50f);
+                _ctSpawnCenter = new Vector(2400f, 1800f, 160f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("dust2"))
+            {
+                _tSpawnCenter = new Vector(0f, -700f, 100f);
+                _ctSpawnCenter = new Vector(-1000f, 2200f, 50f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("anubis"))
+            {
+                _tSpawnCenter = new Vector(-700f, -1500f, 50f);
+                _ctSpawnCenter = new Vector(200f, 2200f, 50f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("ancient"))
+            {
+                _tSpawnCenter = new Vector(-2000f, 0f, 50f);
+                _ctSpawnCenter = new Vector(1800f, 0f, 50f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("nuke"))
+            {
+                _tSpawnCenter = new Vector(-3200f, -900f, -400f);
+                _ctSpawnCenter = new Vector(3200f, -900f, -400f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("vertigo"))
+            {
+                _tSpawnCenter = new Vector(-1400f, -1200f, 11700f);
+                _ctSpawnCenter = new Vector(-1000f, 600f, 11700f);
+                _spawnsResolved = true;
+            }
+            else if (map.Contains("overpass"))
+            {
+                _tSpawnCenter = new Vector(-2200f, 400f, 480f);
+                _ctSpawnCenter = new Vector(-2600f, 5200f, 450f);
+                _spawnsResolved = true;
+            }
+        }
+
+        private static CsTeam GetHumanTeam()
+        {
+            for (int s = 0; s < 64; s++)
+            {
+                var p = Utilities.GetPlayerFromSlot(s);
+                if (p != null && p.IsValid && !p.IsBot && !p.IsHLTV && (p.TeamNum == 2 || p.TeamNum == 3))
+                {
+                    return p.Team;
+                }
+            }
+            return CsTeam.None;
+        }
 
         public override void Load(bool hotReload)
         {
+            ResetServerMaxPlayersCache();
             for (int i = 0; i < MAX_SLOTS; i++)
             {
                 _agents[i] = new BotAgentContext { Slot = i };
@@ -275,19 +493,38 @@ namespace BotProTactics
 
             _controllerCap = new PluginCapability<IBotControllerApi>("botcontroller:api");
 
+            RegisterListener<Listeners.OnMapStart>(_ =>
+            {
+                ResetServerMaxPlayersCache();
+                Server.ExecuteCommand("exec my_bot_normal_config.cfg");
+                AddTimer(1.0f, () =>
+                {
+                    try
+                    {
+                        Server.ExecuteCommand("exec my_bot_normal_config.cfg");
+                        Logger.LogInformation("[BotProTactics] Successfully auto-executed my_bot_normal_config.cfg on map load.");
+                    }
+                    catch { }
+                });
+            });
+
             RegisterEventHandler<EventWeaponFire>(OnWeaponFire);
             RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt);
             RegisterEventHandler<EventPlayerDeath>(OnPlayerDeath);
             RegisterEventHandler<EventBombBegindefuse>(OnBombBeginDefuse);
             RegisterEventHandler<EventBombPlanted>(OnBombPlanted);
             RegisterEventHandler<EventRoundStart>(OnRoundStart);
+            RegisterEventHandler<EventRoundFreezeEnd>(OnRoundFreezeEnd);
+            RegisterEventHandler<EventRoundEnd>(OnRoundEnd);
 
             RegisterListener<Listeners.OnTick>(OnTick);
 
             AddCommand("css_bot_brain", "Inspect real-time Utility AI scores and states of all bots", OnBotBrainCommand);
             AddCommand("css_bot_tempo", "Set round tempo mode: auto, default, rush, split", OnBotTempoCommand);
+            AddCommand("css_bot_challenge", "Set challenge difficulty vs human player: off, normal, hard", OnBotChallengeCommand);
+            AddCommand("bot_challenge", "Set challenge difficulty vs human player: off, normal, hard", OnBotChallengeCommand);
 
-            Logger.LogInformation("[BotProTactics] v3.2.0 Loaded! Utility AI, Subtick Biomechanics, C4 Retake, Forward Cone Guard active.");
+            Logger.LogInformation("[BotProTactics] v3.3.0 Loaded! Utility AI, Planted Burst Discipline, C4 Retake, Slot64 Scan active.");
         }
 
         public override void OnAllPluginsLoaded(bool hotReload)
@@ -333,9 +570,10 @@ namespace BotProTactics
 
         private void OnBotBrainCommand(CCSPlayerController? caller, CommandInfo info)
         {
-            Console.WriteLine($"=== [BotProTactics v3.1 Utility AI Telemetry] Tempo={CurrentTempo} BombPlanted={_isBombPlanted} ===");
-            foreach (var p in Utilities.GetPlayers())
+            Console.WriteLine($"=== [BotProTactics v3.3 Utility AI Telemetry] Tempo={CurrentTempo} BombPlanted={_isBombPlanted} ===");
+            for (int slot = 0; slot < 64; slot++)
             {
+                var p = Utilities.GetPlayerFromSlot(slot);
                 if (p == null || !p.IsValid || !p.IsBot || !p.PawnIsAlive) continue;
                 int s = p.Slot;
                 if (s < 0 || s >= MAX_SLOTS) continue;
@@ -363,12 +601,26 @@ namespace BotProTactics
             Console.WriteLine($"[BotProTactics] Tempo mode = {_forcedTempoMode} (Current active: {CurrentTempo})");
         }
 
+        private void OnBotChallengeCommand(CCSPlayerController? caller, CommandInfo info)
+        {
+            if (info.ArgCount > 1)
+            {
+                string mode = info.GetArg(1).Trim().ToLowerInvariant();
+                if (mode == "off" || mode == "normal" || mode == "hard")
+                {
+                    _botChallengeMode = mode;
+                }
+            }
+            Console.WriteLine($"[BotProTactics] Challenge mode = {_botChallengeMode}");
+        }
+
         // =========================================================================
         // 4. GAME EVENT HANDLERS (SENSORY PERCEPTION, CALLOUTS & MEMORY)
         // =========================================================================
 
         private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
         {
+            ResetServerMaxPlayersCache();
             for (int i = 0; i < MAX_SLOTS; i++)
             {
                 _agents[i].ResetForRound(i);
@@ -378,56 +630,152 @@ namespace BotProTactics
             _bombPlantTime = 0f;
             _hasPlantedC4Pos = false;
 
-            if (_forcedTempoMode == "default")
+            ResolveMapBombsites();
+            ResolveMapSpawns();
+
+            if (EnableIglVirtual)
             {
-                CurrentTempo = RoundTempo.DefaultHold;
-            }
-            else if (_forcedTempoMode == "rush")
-            {
-                CurrentTempo = RoundTempo.FastRush;
-            }
-            else if (_forcedTempoMode == "split")
-            {
-                CurrentTempo = RoundTempo.FakeSplit;
+                if (_consecutiveTLosses >= 2)
+                {
+                    // IGL adapts: swap bombsite and vary tempo dynamically to break losing streaks!
+                    _targetBombsite = (_targetBombsite == "A") ? "B" : "A";
+                    int adaptRoll = Random.Shared.Next(0, 100);
+                    if (adaptRoll < 40)
+                    {
+                        CurrentTempo = RoundTempo.FastRush; // Sudden coordinated blitz
+                    }
+                    else if (adaptRoll < 75)
+                    {
+                        CurrentTempo = RoundTempo.DefaultHold; // Heavy 5-man site execute
+                    }
+                    else
+                    {
+                        CurrentTempo = RoundTempo.FakeSplit; // 3-2 split pressure
+                    }
+                }
+                else
+                {
+                    _targetBombsite = (Random.Shared.Next(0, 2) == 0) ? "A" : "B";
+                    if (_forcedTempoMode == "default") CurrentTempo = RoundTempo.DefaultHold;
+                    else if (_forcedTempoMode == "rush") CurrentTempo = RoundTempo.FastRush;
+                    else if (_forcedTempoMode == "split") CurrentTempo = RoundTempo.FakeSplit;
+                    else
+                    {
+                        int roll = Random.Shared.Next(0, 100);
+                        if (roll < 45) CurrentTempo = RoundTempo.DefaultHold;
+                        else if (roll < 75) CurrentTempo = RoundTempo.FakeSplit;
+                        else CurrentTempo = RoundTempo.FastRush;
+                    }
+                }
+
+                Logger.LogInformation($"[BotProTactics] [IGL Virtual] Round Plan: Target={_targetBombsite} | Tempo={CurrentTempo} | T-Losses={_consecutiveTLosses} | CT-Losses={_consecutiveCTLosses}");
             }
             else
             {
-                int roll = Random.Shared.Next(0, 100);
-                if (roll < 50) CurrentTempo = RoundTempo.DefaultHold;
-                else if (roll < 75) CurrentTempo = RoundTempo.FastRush;
-                else CurrentTempo = RoundTempo.FakeSplit;
+                if (_forcedTempoMode == "default")
+                {
+                    CurrentTempo = RoundTempo.DefaultHold;
+                }
+                else if (_forcedTempoMode == "rush")
+                {
+                    CurrentTempo = RoundTempo.FastRush;
+                }
+                else if (_forcedTempoMode == "split")
+                {
+                    CurrentTempo = RoundTempo.FakeSplit;
+                }
+                else
+                {
+                    int roll = Random.Shared.Next(0, 100);
+                    if (roll < 50) CurrentTempo = RoundTempo.DefaultHold;
+                    else if (roll < 75) CurrentTempo = RoundTempo.FastRush;
+                    else CurrentTempo = RoundTempo.FakeSplit;
+                }
             }
 
-            float nowSec = Server.CurrentTime;
+            // Do NOT assign holds in freeze time! Holds must only activate after FreezeEnd when bots take space.
+            return HookResult.Continue;
+        }
+
+        private HookResult OnRoundFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
+        {
+            _freezeEndTime = Server.CurrentTime;
+            ResolveMapBombsites();
+            ResolveMapSpawns();
+            ApplyLiveIglPlanAndTempos(Server.CurrentTime);
+            return HookResult.Continue;
+        }
+
+        private void ApplyLiveIglPlanAndTempos(float liveStartSec)
+        {
+            Vector mainTarget = (_targetBombsite == "A") ? _siteAPos : _siteBPos;
+            Vector fakeTarget = (_targetBombsite == "A") ? _siteBPos : _siteAPos;
+            int tBotIdx = 0;
             int holdsAssigned = 0;
 
-            if (EnableAntiRushTempos)
+            for (int slot = 0; slot < 64; slot++)
             {
-                foreach (var player in Utilities.GetPlayers())
+                var player = Utilities.GetPlayerFromSlot(slot);
+                if (player == null || !player.IsValid || !player.IsBot || player.Slot < 0 || player.Slot >= MAX_SLOTS)
+                    continue;
+
+                var ctx = _agents[player.Slot];
+                ctx.HoldUntilSec = 0f;
+                ctx.IsAnchoredOnSightline = false;
+
+                if (player.Team == CsTeam.Terrorist)
                 {
-                    if (player != null && player.IsValid && player.IsBot && player.Slot >= 0 && player.Slot < MAX_SLOTS)
+                    if (EnableIglVirtual)
                     {
-                        var ctx = _agents[player.Slot];
-                        if (CurrentTempo == RoundTempo.DefaultHold)
+                        if (CurrentTempo == RoundTempo.FakeSplit && tBotIdx < 2)
                         {
-                            int minHold = (player.Team == CsTeam.CounterTerrorist) ? 22 : 16;
-                            int maxHold = (player.Team == CsTeam.CounterTerrorist) ? 35 : 28;
-                            ctx.HoldUntilSec = nowSec + Random.Shared.Next(minHold, maxHold);
-                            holdsAssigned++;
+                            ctx.Threat.Set(fakeTarget, liveStartSec + 25.0f, ThreatType.TeamCallout, 1.12f);
                         }
-                        else if (CurrentTempo == RoundTempo.FakeSplit)
+                        else
                         {
-                            if (Random.Shared.Next(0, 2) == 0)
-                            {
-                                ctx.HoldUntilSec = nowSec + Random.Shared.Next(18, 32);
-                                holdsAssigned++;
-                            }
+                            ctx.Threat.Set(mainTarget, liveStartSec + 35.0f, ThreatType.TeamCallout, 1.15f);
+                        }
+                    }
+
+                    // Realism: Terrorists NEVER hold in their own spawn!
+                    // All 5 TRs sprint out into the map to contest space or execute.
+                    tBotIdx++;
+                }
+                else if (player.Team == CsTeam.CounterTerrorist && EnableAntiRushTempos)
+                {
+                    // CTs get angle holding schedules (which only take effect once they arrive at bombsite/posts >= 8s from freeze end)
+                    if (CurrentTempo == RoundTempo.DefaultHold)
+                    {
+                        ctx.HoldUntilSec = liveStartSec + Random.Shared.Next(14, 24);
+                        holdsAssigned++;
+                    }
+                    else if (CurrentTempo == RoundTempo.FakeSplit || CurrentTempo == RoundTempo.FastRush)
+                    {
+                        if (Random.Shared.Next(0, 2) == 0)
+                        {
+                            ctx.HoldUntilSec = liveStartSec + Random.Shared.Next(10, 18);
+                            holdsAssigned++;
                         }
                     }
                 }
             }
 
-            Logger.LogInformation("[BotProTactics] Round Start | Tempo={Tempo} | Tactical Holds={Holds}", CurrentTempo, holdsAssigned);
+            Logger.LogInformation("[BotProTactics] Live IGL Plan | Target={Site} | Tempo={Tempo} | Holds={Holds}", _targetBombsite, CurrentTempo, holdsAssigned);
+        }
+
+        private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
+        {
+            int winner = @event.Winner;
+            if (winner == (int)CsTeam.Terrorist)
+            {
+                _consecutiveTLosses = 0;
+                _consecutiveCTLosses++;
+            }
+            else if (winner == (int)CsTeam.CounterTerrorist)
+            {
+                _consecutiveTLosses++;
+                _consecutiveCTLosses = 0;
+            }
             return HookResult.Continue;
         }
 
@@ -513,14 +861,16 @@ namespace BotProTactics
             {
                 CsTeam shooterTeam = shooter.Team;
                 int enemyAliveCount = 0;
-                foreach (var p in Utilities.GetPlayers())
+                for (int s = 0; s < 64; s++)
                 {
+                    var p = Utilities.GetPlayerFromSlot(s);
                     if (p != null && p.IsValid && p.PawnIsAlive && p.Team == shooterTeam)
                         enemyAliveCount++;
                 }
 
-                foreach (var player in Utilities.GetPlayers())
+                for (int s = 0; s < 64; s++)
                 {
+                    var player = Utilities.GetPlayerFromSlot(s);
                     if (player == null || !player.IsValid || !player.IsBot || !player.PawnIsAlive || player.Team == shooterTeam || player.Slot == slot)
                         continue;
 
@@ -647,8 +997,9 @@ namespace BotProTactics
                 // Count remaining defenders near the victim's site (<= 900u) and remaining living enemies
                 int alliesLeftNearSite = 0;
                 int enemyAliveCount = 0;
-                foreach (var p in Utilities.GetPlayers())
+                for (int s = 0; s < 64; s++)
                 {
+                    var p = Utilities.GetPlayerFromSlot(s);
                     if (p == null || !p.IsValid || !p.PawnIsAlive || p.Slot == victim.Slot) continue;
                     if (p.Team != victimTeam)
                     {
@@ -664,8 +1015,9 @@ namespace BotProTactics
                     }
                 }
 
-                foreach (var player in Utilities.GetPlayers())
+                for (int s = 0; s < 64; s++)
                 {
+                    var player = Utilities.GetPlayerFromSlot(s);
                     if (player != null && player.IsValid && player.IsBot && player.PawnIsAlive && player.Team == victimTeam && player.Slot != victim.Slot)
                     {
                         int slot = player.Slot;
@@ -689,14 +1041,19 @@ namespace BotProTactics
 
                         if (EnableTradeFrags && dist <= 950.0f)
                         {
-                            ctx.RefragUntilMs = nowMs + 2200;
+                            bool isHumanKiller = (attacker != null && !attacker.IsBot);
+                            int refragDuration = (isHumanKiller && _botChallengeMode == "hard") ? 2900 : 2200;
+                            float threatPrio = (isHumanKiller && _botChallengeMode == "hard") ? 1.60f : 1.42f;
+
+                            ctx.RefragUntilMs = nowMs + refragDuration;
                             ctx.LastCombatMs = nowMs;
                             if (ctx.PhaseStartMs == 0) ctx.PhaseStartMs = nowMs;
 
                             Vector targetSpot = killerPos ?? victimPos;
-                            ctx.Threat.Set(targetSpot, nowSec + 2.00f, ThreatType.TeammateDeath, 1.42f);
+                            ctx.Threat.Set(targetSpot, nowSec + 2.40f, ThreatType.TeammateDeath, threatPrio);
 
-                            if (EnableContextualPeeks && killerPos != null && dist < 750.0f && ctx.ActivePeek == PeekStyle.None)
+                            float maxPeekDist = (isHumanKiller && _botChallengeMode == "hard") ? 850.0f : 750.0f;
+                            if (EnableContextualPeeks && killerPos != null && dist < maxPeekDist && ctx.ActivePeek == PeekStyle.None)
                             {
                                 int dir = PickBestStrafeDirection(ctx);
                                 StartPeek(ctx, PeekStyle.FerrariPrefire, dir, killerPos.X, killerPos.Y, killerPos.Z, nowMs);
@@ -711,9 +1068,44 @@ namespace BotProTactics
 
         private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
         {
+            var defuser = @event.Userid;
+            float nowSec = Server.CurrentTime;
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+            // Realism: Notify living Terrorist bots within audible defuse sound radius (~1150u) that the bomb is being defused!
+            Vector c4Pos = _hasPlantedC4Pos ? new Vector(_plantedC4X, _plantedC4Y, _plantedC4Z) : (defuser?.PlayerPawn?.Value?.AbsOrigin ?? new Vector(0, 0, 0));
+            for (int s = 0; s < 64; s++)
+            {
+                var tPlayer = Utilities.GetPlayerFromSlot(s);
+                if (tPlayer != null && tPlayer.IsValid && tPlayer.IsBot && tPlayer.PawnIsAlive && tPlayer.Team == CsTeam.Terrorist)
+                {
+                    int tSlot = tPlayer.Slot;
+                    var tPawn = tPlayer.PlayerPawn?.Value;
+                    if (tSlot >= 0 && tSlot < MAX_SLOTS && tPawn != null && tPawn.IsValid && tPawn.AbsOrigin != null)
+                    {
+                        float distToC4 = Dist3D(c4Pos, tPawn.AbsOrigin);
+                        if (distToC4 <= 1150.0f)
+                        {
+                            var tCtx = _agents[tSlot];
+                            // Break passive hold and post-plant anchor so TR swings immediately to contest defuse!
+                            tCtx.BombDefuseAlertUntilSec = nowSec + 4.8f;
+                            tCtx.HoldUntilSec = 0f;
+                            tCtx.IsAnchoredOnSightline = false;
+                            tCtx.Threat.Set(c4Pos, nowSec + 4.8f, ThreatType.Gunfire, 1.90f);
+                            tCtx.LastCombatMs = nowMs;
+
+                            if (EnableContextualPeeks && distToC4 > 200.0f && distToC4 < 850.0f && tCtx.ActivePeek == PeekStyle.None && (tCtx.CanStrafeLeft || tCtx.CanStrafeRight))
+                            {
+                                int dir = PickBestStrafeDirection(tCtx);
+                                StartPeek(tCtx, PeekStyle.FerrariPrefire, dir, c4Pos.X, c4Pos.Y, c4Pos.Z, nowMs);
+                            }
+                        }
+                    }
+                }
+            }
+
             if (!EnableFakeDefuse) return HookResult.Continue;
 
-            var defuser = @event.Userid;
             if (defuser == null || !defuser.IsValid || !defuser.IsBot)
                 return HookResult.Continue;
 
@@ -727,8 +1119,9 @@ namespace BotProTactics
 
             int livingCTs = 0;
             int livingTs = 0;
-            foreach (var player in Utilities.GetPlayers())
+            for (int s = 0; s < 64; s++)
             {
+                var player = Utilities.GetPlayerFromSlot(s);
                 if (player != null && player.IsValid && player.PawnIsAlive)
                 {
                     if (player.Team == CsTeam.CounterTerrorist) livingCTs++;
@@ -788,7 +1181,9 @@ namespace BotProTactics
         {
             try
             {
-                if (string.IsNullOrEmpty(Server.MapName)) return;
+                string? mapName = Server.MapName;
+                if (string.IsNullOrEmpty(mapName) || string.Equals(mapName, "<empty>", StringComparison.OrdinalIgnoreCase))
+                    return;
                 OnTickCore();
             }
             catch { }
@@ -808,8 +1203,9 @@ namespace BotProTactics
             int livingPlayersCount = 0;
             int livingBotsCount = 0;
 
-            foreach (var p in Utilities.GetPlayers())
+            for (int s = 0; s < 64; s++)
             {
+                var p = Utilities.GetPlayerFromSlot(s);
                 if (p != null && p.IsValid && p.PawnIsAlive && p.Slot >= 0 && p.Slot < MAX_SLOTS)
                 {
                     if (p.Team == CsTeam.CounterTerrorist) ctAlive++;
@@ -950,6 +1346,14 @@ namespace BotProTactics
                     SuppressCombatJump(pawn, ccsBot, nowSec);
                 }
 
+                // Yield movement & aim completely while NadeSystem is executing a 350ms grenade lineup/throw!
+                bool isThrowingGrenade = (api != null && (api.GetWeaponLock(slot) == LockTarget.Slot4 || api.IsLocked(slot, LockKind.Aim)));
+                if (isThrowingGrenade)
+                {
+                    ctx.ActivePeek = PeekStyle.None;
+                    continue;
+                }
+
                 // B. Execute Contextual Peeks (Wall-Safe via RayTrace!)
                 if (EnableContextualPeeks && ctx.ActivePeek != PeekStyle.None && api != null)
                 {
@@ -1015,11 +1419,14 @@ namespace BotProTactics
                 scores.Combat = 0.68f * decay;
             }
 
+            bool isAllyInHardMode = (_botChallengeMode == "hard" && _cachedHumanTeam != CsTeam.None && bot.Team == _cachedHumanTeam);
+
             // 3. Trade Frag Utility (High urgency right after nearby ally dies)
             if (EnableTradeFrags && nowMs < ctx.RefragUntilMs && hp > 25 && ctx.Clip1 > 3)
             {
                 float remaining = (ctx.RefragUntilMs - nowMs) / 2200.0f;
-                scores.Trade = 0.86f * Math.Clamp(remaining + 0.3f, 0.4f, 1.0f);
+                float tradeBase = isAllyInHardMode ? 0.72f : 0.90f;
+                scores.Trade = tradeBase * Math.Clamp(remaining + 0.3f, 0.4f, 1.0f);
             }
 
             // 4. Tactical Retreat Utility (Exponential survival curve on low HP or empty primary magazine)
@@ -1036,14 +1443,14 @@ namespace BotProTactics
                 }
             }
 
-            // 5. Angle Slice & Contextual Peek Utility
+            // 5. Angle Slice & Contextual Peek Utility (Only for real enemy contacts, NEVER for abstract round-start site waypoints!)
             if (EnableContextualPeeks && !hasDirectEnemyInSight)
             {
                 if (ctx.ActivePeek != PeekStyle.None)
                 {
                     scores.Peek = 0.82f;
                 }
-                else if (ctx.Threat.Active && nowSec < ctx.Threat.ExpireTime)
+                else if (ctx.Threat.Active && nowSec < ctx.Threat.ExpireTime && (ctx.Threat.Type != ThreatType.TeamCallout || ctx.Threat.Priority >= 1.30f))
                 {
                     Vector? origin = pawn.AbsOrigin;
                     if (origin != null)
@@ -1051,30 +1458,124 @@ namespace BotProTactics
                         float dThreat = Dist2D(origin.X, origin.Y, ctx.Threat.X, ctx.Threat.Y);
                         if (dThreat > 260.0f && dThreat < 850.0f && (ctx.CanStrafeLeft || ctx.CanStrafeRight))
                         {
-                            scores.Peek = 0.74f;
+                            scores.Peek = isAllyInHardMode ? 0.65f : 0.76f;
                         }
                     }
                 }
             }
 
-            // 6. Objective Control Utility (Post-Plant T Anchor / CT Retake Stealth)
+            // 6. Objective Control Utility (Post-Plant T Anchor / CT Retake Stealth & Synchronized Push)
             if (_isBombPlanted && _hasPlantedC4Pos && !hasDirectEnemyInSight && pawn.AbsOrigin != null)
             {
                 float dxC4 = pawn.AbsOrigin.X - _plantedC4X;
                 float dyC4 = pawn.AbsOrigin.Y - _plantedC4Y;
                 float dzC4 = pawn.AbsOrigin.Z - _plantedC4Z;
                 float distToC4 = MathF.Sqrt(dxC4 * dxC4 + dyC4 * dyC4 + dzC4 * dzC4);
-                if (distToC4 > 160.0f && distToC4 < 1650.0f)
+
+                if (bot.Team == CsTeam.CounterTerrorist)
                 {
-                    scores.Objective = 0.64f;
+                    // CT Retake Staging: When 2+ CTs are alive, do not feed 1-by-1!
+                    // Lead CT waits briefly (1.2-1.5s) if partner is catching up right behind
+                    if (teamAlive >= 2 && distToC4 > 650.0f && distToC4 < 1250.0f)
+                    {
+                        bool partnerCatchingUp = false;
+                        for (int s = 0; s < 64; s++)
+                        {
+                            var teammate = Utilities.GetPlayerFromSlot(s);
+                            if (teammate != null && teammate.IsValid && teammate.IsBot && teammate.PawnIsAlive && teammate.Team == CsTeam.CounterTerrorist && teammate.Slot != bot.Slot)
+                            {
+                                var tmPawn = teammate.PlayerPawn?.Value;
+                                if (tmPawn != null && tmPawn.IsValid && tmPawn.AbsOrigin != null)
+                                {
+                                    float dPartner = Dist3D(pawn.AbsOrigin, tmPawn.AbsOrigin);
+                                    if (dPartner > 260.0f && dPartner < 850.0f)
+                                    {
+                                        partnerCatchingUp = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (partnerCatchingUp && ctx.RetakeStagingUntilSec == 0f)
+                        {
+                            ctx.RetakeStagingUntilSec = nowSec + 1.35f;
+                        }
+
+                        if (nowSec < ctx.RetakeStagingUntilSec)
+                        {
+                            scores.Hold = 0.85f;
+                        }
+                        else
+                        {
+                            scores.Objective = 0.80f;
+                        }
+                    }
+                    else
+                    {
+                        scores.Objective = 0.72f;
+                    }
+                }
+                else // Terrorist post-plant crossfire defense
+                {
+                    if (nowSec < ctx.BombDefuseAlertUntilSec)
+                    {
+                        // Active defuse heard! Never sit in passive Hold — swing/push to contest the defuser immediately!
+                        scores.Hold = 0f;
+                        scores.Objective = 0.88f;
+                        if (ctx.ActivePeek != PeekStyle.None)
+                        {
+                            scores.Peek = MathF.Max(scores.Peek, 0.91f);
+                        }
+                    }
+                    else if (distToC4 > 160.0f && distToC4 < 1650.0f)
+                    {
+                        // With numbers or even, anchor site crossfire and don't hunt CT spawn!
+                        if (teamAlive >= enemyAlive && distToC4 < 900.0f)
+                        {
+                            scores.Hold = 0.78f;
+                        }
+                        else
+                        {
+                            scores.Objective = 0.64f;
+                        }
+                    }
                 }
             }
 
             // 7. Tactical Hold ("No Shiu" Passive Angle Anchor)
-            if (EnableAntiRushTempos && !_isBombPlanted && !hasDirectEnemyInSight && nowSec < ctx.HoldUntilSec)
+            // Realism: Bots must NEVER hold in their own spawn (< 950u) or during the opening sprint (< 8s)!
+            bool nearOwnSpawn = false;
+            if (pawn.AbsOrigin != null && _spawnsResolved)
+            {
+                Vector spawn = (bot.Team == CsTeam.Terrorist) ? _tSpawnCenter : _ctSpawnCenter;
+                if (Dist2D(pawn.AbsOrigin.X, pawn.AbsOrigin.Y, spawn.X, spawn.Y) < 950.0f)
+                {
+                    nearOwnSpawn = true;
+                }
+            }
+
+            if (EnableAntiRushTempos && !_isBombPlanted && !hasDirectEnemyInSight && nowSec < ctx.HoldUntilSec && !nearOwnSpawn && (nowSec - _freezeEndTime >= 8.0f))
             {
                 float wepBonus = (ctx.EquippedClass == WeaponClass.Sniper) ? 0.12f : 0.05f;
                 scores.Hold = 0.56f + wepBonus;
+            }
+
+            // 8. C4 Carrier Protection Rule:
+            // When teammates are alive, carrier must not lead solo dry-peeks into unknown territory.
+            // In a 1vX clutch (teamAlive <= 1) or when already inside a bombsite, carrier plays at 100% capability!
+            if (ctx.IsC4Carrier && !_isBombPlanted && teamAlive >= 2)
+            {
+                scores.Peek *= 0.25f;
+                if (!hasDirectEnemyInSight && nearbyAllies == 0 && nearbyEnemies >= 1 && pawn.AbsOrigin != null)
+                {
+                    float dSiteA = Dist3D(pawn.AbsOrigin, _siteAPos);
+                    float dSiteB = Dist3D(pawn.AbsOrigin, _siteBPos);
+                    if (dSiteA > 550.0f && dSiteB > 550.0f)
+                    {
+                        scores.Retreat = MathF.Max(scores.Retreat, 0.70f);
+                    }
+                }
             }
 
             ctx.LastScores = scores;
@@ -1082,6 +1583,12 @@ namespace BotProTactics
 
             if (nextState != ctx.CurrentState)
             {
+                if (nextState == TacticalState.CombatDuel || nextState == TacticalState.TradeFrag)
+                {
+                    ctx.CombatPhase = 0;
+                    ctx.PhaseStartMs = nowMs;
+                    ctx.DidCrouchTap = false;
+                }
                 ctx.CurrentState = nextState;
                 ctx.StateEnteredAt = nowSec;
             }
@@ -1128,10 +1635,20 @@ namespace BotProTactics
             float speed2D = (vel != null) ? MathF.Sqrt(vel.X * vel.X + vel.Y * vel.Y) : 0f;
 
             // 2. Check forward sightline depth for TacticalHold ("No Shiu" angle anchoring)
-            // ONLY anchor when the bot has actually stopped/settled (< 28 u/s), NEVER while sprinting across the map!
+            // ONLY anchor when the bot has actually stopped/settled (< 28 u/s), NEVER while sprinting across the map or near spawn or in opening seconds!
             if (ctx.CurrentState == TacticalState.TacticalHold)
             {
-                if (!ctx.IsAnchoredOnSightline && speed2D < 28.0f)
+                bool nearSpawn = false;
+                if (_spawnsResolved)
+                {
+                    Vector spawn = (pawn.TeamNum == 2) ? _tSpawnCenter : _ctSpawnCenter;
+                    if (Dist2D(botOrigin.X, botOrigin.Y, spawn.X, spawn.Y) < 950.0f)
+                    {
+                        nearSpawn = true;
+                    }
+                }
+
+                if (!ctx.IsAnchoredOnSightline && speed2D < 28.0f && !nearSpawn && (nowSec - _freezeEndTime >= 8.0f))
                 {
                     float fwdDepth = MeasureRayDistance(rayTrace, botOrigin.X, botOrigin.Y, eyeZ, fwdX, fwdY, 950.0f);
                     if (fwdDepth >= 560.0f)
@@ -1140,14 +1657,10 @@ namespace BotProTactics
                         ctx.AnchoredYaw = eyeAngles.Y;
                     }
                 }
-                else if (ctx.IsAnchoredOnSightline && speed2D > 38.0f && vel != null)
+                else if (ctx.IsAnchoredOnSightline && (speed2D > 38.0f || nearSpawn || (nowSec - _freezeEndTime < 8.0f)))
                 {
-                    float moveYaw = MathF.Atan2(vel.Y, vel.X) * (180.0f / MathF.PI);
-                    if (MathF.Abs(NormalizeAngle(moveYaw - ctx.AnchoredYaw)) > 40.0f)
-                    {
-                        ctx.IsAnchoredOnSightline = false;
-                        ctx.HoldUntilSec = 0f;
-                    }
+                    ctx.IsAnchoredOnSightline = false;
+                    ctx.HoldUntilSec = 0f;
                 }
             }
             else
@@ -1289,11 +1802,17 @@ namespace BotProTactics
                 api.SwitchBotWeapon(slot, ctx.SecondaryDefIndex);
             }
 
-            // 2. COMBAT DUEL & TRADE FRAG (Wall-Safe ADAD Burst + Subtick Counter-Strafe < 72 u/s)
+            // 2. COMBAT DUEL & TRADE FRAG (Entry Subtick Counter-Strafe -> Planted 435ms Burst -> Short 120ms Micro-Strafe)
             if (EnableAdadStrafe && (ctx.CurrentState == TacticalState.CombatDuel || ctx.CurrentState == TacticalState.TradeFrag))
             {
                 long elapsed = nowMs - ctx.PhaseStartMs;
                 float dist = ctx.TargetDistance;
+
+                // Never suppress native firing during active combat!
+                if (ccsBot != null)
+                {
+                    ccsBot.FireWeaponTimestamp = 0f;
+                }
 
                 // Close Range (< 420u): Controlled crouch commit + full-auto spray / rapid pistol cadence
                 if (EnableDistanceCombatDiscipline && dist < 420.0f && hasDirectEnemyInSight)
@@ -1301,27 +1820,27 @@ namespace BotProTactics
                     if (ccsBot != null)
                     {
                         ccsBot.IsRapidFiring = (ctx.EquippedClass == WeaponClass.Pistol);
-                        ccsBot.FireWeaponTimestamp = 0f;
                     }
-                    if (dist < 310.0f)
+                    if (dist < 320.0f)
                     {
                         api.InjectUsercmd(slot, IN_DUCK, 55);
                         return;
                     }
                 }
 
-                // If both left and right are blocked (tight alcove), hold stationary accuracy
-                if (!ctx.CanStrafeLeft && !ctx.CanStrafeRight)
-                {
-                    api.InjectUsercmd(slot, 0UL, 50);
-                    return;
-                }
-
                 Vector? vel = pawn.AbsVelocity;
                 float speed2D = (vel != null) ? MathF.Sqrt(vel.X * vel.X + vel.Y * vel.Y) : 0f;
 
-                // Long Range (> 900u): Disciplined strafe -> subtick stop -> 1-tap / 2-tap headshot cadence
-                if (EnableDistanceCombatDiscipline && dist > 900.0f)
+                // If both left and right are blocked (tight alcove), hold stationary accuracy
+                if (!ctx.CanStrafeLeft && !ctx.CanStrafeRight)
+                {
+                    if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
+                    if (pawn.AbsVelocity != null && speed2D > 40.0f) { pawn.AbsVelocity.X *= 0.5f; pawn.AbsVelocity.Y *= 0.5f; }
+                    return;
+                }
+
+                // Long Range (> 1100u): Entry Counter-Strafe (0..45ms) -> Planted 2-3 Tap Window (280ms) -> Short Micro-Strafe (115ms)
+                if (EnableDistanceCombatDiscipline && dist > 1100.0f)
                 {
                     if (ccsBot != null)
                     {
@@ -1329,41 +1848,38 @@ namespace BotProTactics
                     }
                     if (ctx.CombatPhase == 0)
                     {
-                        // Hold fire while wide-strafing at long range if we already fired our 2-tap burst
-                        if (ccsBot != null && ctx.SprayTicks >= 2)
+                        if (speed2D > 65.0f && elapsed < 45)
                         {
-                            ccsBot.FireWeaponTimestamp = nowSec + 0.16f;
+                            ulong counterBtn = (ctx.StrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
+                            api.InjectUsercmd(slot, counterBtn, 38);
                         }
-                        ulong moveBtn = (ctx.StrafeDir > 0) ? IN_MOVERIGHT : IN_MOVELEFT;
-                        api.InjectUsercmd(slot, moveBtn, 40);
-                        if (elapsed >= 155)
+                        else
                         {
                             ctx.CombatPhase = 1;
                             ctx.PhaseStartMs = nowMs;
+                            ctx.SprayTicks = 0;
+                            if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
                         }
                     }
                     else if (ctx.CombatPhase == 1)
                     {
-                        ulong counterBtn = (ctx.StrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
-                        api.InjectUsercmd(slot, counterBtn, 38);
-                        if ((EnableSubtickStop && speed2D < 72.0f) || elapsed >= 45)
+                        // Planted Accurate Tap/Burst Window (280ms): zero lateral movement!
+                        if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
+                        if (pawn.AbsVelocity != null && speed2D > 45.0f) { pawn.AbsVelocity.X *= 0.5f; pawn.AbsVelocity.Y *= 0.5f; }
+                        if (elapsed >= 280)
                         {
+                            ctx.StrafeDir = PickNextStrafeDirection(ctx);
                             ctx.CombatPhase = 2;
                             ctx.PhaseStartMs = nowMs;
-                            ctx.SprayTicks = 0;
-                            if (ccsBot != null) ccsBot.FireWeaponTimestamp = 0f;
                         }
                     }
                     else
                     {
-                        if (ccsBot != null && ctx.SprayTicks < 2)
+                        // Short Evasive Micro-Strafe (115ms) after completing burst
+                        ulong moveBtn = (ctx.StrafeDir > 0) ? IN_MOVERIGHT : IN_MOVELEFT;
+                        api.InjectUsercmd(slot, moveBtn, 40);
+                        if (elapsed >= 115)
                         {
-                            ccsBot.FireWeaponTimestamp = 0f;
-                        }
-                        api.InjectUsercmd(slot, 0UL, 55);
-                        if (elapsed >= 120)
-                        {
-                            ctx.StrafeDir = PickNextStrafeDirection(ctx);
                             ctx.CombatPhase = 0;
                             ctx.PhaseStartMs = nowMs;
                         }
@@ -1371,51 +1887,54 @@ namespace BotProTactics
                     return;
                 }
 
-                // Mid Range (310 - 900u): Pro ADAD 4-Bullet Burst + Subtick Stop + 20% Crouch-Tap Evasion
+                // Mid Range (320 - 1100u): Entry Subtick Counter-Strafe -> Planted Accurate Burst -> Micro-Strafe (120ms)
+                bool isAllyInHardMode = (_botChallengeMode == "hard" && _cachedHumanTeam != CsTeam.None && bot.Team == _cachedHumanTeam);
+                int phase0BrakeMs = isAllyInHardMode ? 90 : 45;
+                int plantedBurstMs = isAllyInHardMode ? 310 : 435;
+
                 if (ctx.CombatPhase == 0)
                 {
-                    // Reset recoil during lateral strafe if 4+ bullets were already fired in the previous burst
-                    if (ccsBot != null && dist >= 450.0f && ctx.SprayTicks >= 4)
+                    // Phase 0: Immediate Subtick Brake if moving > 65 u/s upon entering duel or finishing micro-strafe
+                    if (speed2D > 65.0f && elapsed < phase0BrakeMs)
                     {
-                        ccsBot.IsRapidFiring = false;
-                        ccsBot.FireWeaponTimestamp = nowSec + 0.13f;
+                        ulong counterBtn = (ctx.StrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
+                        api.InjectUsercmd(slot, counterBtn, 38);
                     }
-                    ulong moveBtn = (ctx.StrafeDir > 0) ? IN_MOVERIGHT : IN_MOVELEFT;
-                    api.InjectUsercmd(slot, moveBtn, 42);
-                    if (elapsed >= 175)
+                    else
                     {
                         ctx.CombatPhase = 1;
                         ctx.PhaseStartMs = nowMs;
+                        ctx.DidCrouchTap = false;
+                        ctx.SprayTicks = 0;
+                        if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
                     }
                 }
                 else if (ctx.CombatPhase == 1)
                 {
-                    ulong counterBtn = (ctx.StrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
-                    api.InjectUsercmd(slot, counterBtn, 38);
-                    if ((EnableSubtickStop && speed2D < 72.0f) || elapsed >= 45)
+                    // Phase 1: Planted 5-7 Bullet Accurate Burst Window
+                    if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
+                    if (pawn.AbsVelocity != null && speed2D > 45.0f) { pawn.AbsVelocity.X *= 0.5f; pawn.AbsVelocity.Y *= 0.5f; }
+
+                    if (dist < 680.0f && ctx.SprayTicks >= 3 && !ctx.DidCrouchTap && hasDirectEnemyInSight)
                     {
+                        api.InjectUsercmd(slot, IN_DUCK, 180);
+                        ctx.DidCrouchTap = true;
+                    }
+
+                    if (elapsed >= plantedBurstMs)
+                    {
+                        ctx.StrafeDir = PickNextStrafeDirection(ctx);
                         ctx.CombatPhase = 2;
                         ctx.PhaseStartMs = nowMs;
-                        ctx.DidCrouchTap = false;
-                        ctx.SprayTicks = 0;
-                        if (ccsBot != null) ccsBot.FireWeaponTimestamp = 0f;
                     }
                 }
                 else
                 {
-                    if (ccsBot != null && ctx.SprayTicks < 5)
+                    // Phase 2: Short Evasive Micro-Reposition Strafe (120ms duration)
+                    ulong moveBtn = (ctx.StrafeDir > 0) ? IN_MOVERIGHT : IN_MOVELEFT;
+                    api.InjectUsercmd(slot, moveBtn, 42);
+                    if (elapsed >= 120)
                     {
-                        ccsBot.FireWeaponTimestamp = 0f;
-                    }
-                    if (!ctx.DidCrouchTap && hasDirectEnemyInSight && Random.Shared.Next(0, 100) < 20)
-                    {
-                        api.InjectUsercmd(slot, IN_DUCK, 75);
-                        ctx.DidCrouchTap = true;
-                    }
-
-                    if (elapsed >= 150)
-                    {
-                        ctx.StrafeDir = PickNextStrafeDirection(ctx);
                         ctx.CombatPhase = 0;
                         ctx.PhaseStartMs = nowMs;
                     }
@@ -1426,9 +1945,27 @@ namespace BotProTactics
             // 3. TACTICAL HOLD ("No Shiu" Silent Approach & Sightline Anchor)
             if (ctx.CurrentState == TacticalState.TacticalHold && ctx.ActivePeek == PeekStyle.None)
             {
+                bool nearSpawn = false;
+                if (_spawnsResolved && pawn.AbsOrigin != null)
+                {
+                    Vector spawn = (bot.Team == CsTeam.Terrorist) ? _tSpawnCenter : _ctSpawnCenter;
+                    if (Dist2D(pawn.AbsOrigin.X, pawn.AbsOrigin.Y, spawn.X, spawn.Y) < 950.0f)
+                    {
+                        nearSpawn = true;
+                    }
+                }
+
+                if (nearSpawn || (nowSec - _freezeEndTime < 8.0f))
+                {
+                    ctx.CurrentState = TacticalState.PatrolAndPreAim;
+                    ctx.HoldUntilSec = 0f;
+                    ctx.IsAnchoredOnSightline = false;
+                    return;
+                }
+
                 api.InjectUsercmd(slot, IN_SPEED, 55);
 
-                if (ctx.IsAnchoredOnSightline && pawn.AbsVelocity != null)
+                if (ctx.IsAnchoredOnSightline && pawn.AbsVelocity != null && (ccsBot == null || (ccsBot.ForwardSpeed == 0f && ccsBot.LeftSpeed == 0f)))
                 {
                     float s2d = MathF.Sqrt(pawn.AbsVelocity.X * pawn.AbsVelocity.X + pawn.AbsVelocity.Y * pawn.AbsVelocity.Y);
                     if (s2d < 40.0f)
@@ -1496,26 +2033,21 @@ namespace BotProTactics
             Vector? moveVel = pawn.AbsVelocity;
             float speed2D = (moveVel != null) ? MathF.Sqrt(moveVel.X * moveVel.X + moveVel.Y * moveVel.Y) : 0f;
 
-            // CASE 1: Direct Enemy Visible -> Record visual threat & apply progressive recoil pull-down
+            // CASE 1: Direct Enemy Visible -> Unlock native aim immediately & record visual threat
+            // (Let native CCSBot::UpdateLookAngles + BotAimImprover PickNewAimSpot drive exact head/chest target without conflicting pitch oscillation!)
             if (hasDirectEnemyInSight && ccsBot != null)
             {
+                ccsBot.InhibitLookAroundTimestamp = 0f;
                 if (ccsBot.LastEnemyPosition != null)
                 {
                     ctx.Threat.Set(ccsBot.LastEnemyPosition, nowSec + 2.10f, ThreatType.VisualSight, 1.50f);
                 }
+                return;
+            }
 
-                if (EnableSprayCompensation &&
-                    ctx.TargetDistance < 850.0f &&
-                    ctx.SprayTicks >= 2 &&
-                    (ctx.EquippedClass == WeaponClass.Rifle || ctx.EquippedClass == WeaponClass.SmgOrShotgun))
-                {
-                    float pullDownDegPerSec = (ctx.SprayTicks <= 12) ? 8.8f : 3.1f;
-                    eyeAngles.X = Math.Clamp(eyeAngles.X + pullDownDegPerSec * dt, -52.0f, 52.0f);
-                    if (pawn.V_angle != null)
-                    {
-                        pawn.V_angle.X = eyeAngles.X;
-                    }
-                }
+            // Yield pre-aim when BotState is smoothly dodging/restoring from an incoming flashbang!
+            if (ccsBot?.IsAvoidingGrenade != null && nowSec < ccsBot.IsAvoidingGrenade.Timestamp)
+            {
                 return;
             }
 
@@ -1574,9 +2106,10 @@ namespace BotProTactics
 
                         ApplySmoothHumanAim(pawn, ccsBot, eyeAngles, targetYaw, targetPitch, 410.0f, 3.8f, dt, nowSec);
 
-                        // Trigger Contextual Peek when approaching threat in medium range
+                        // Trigger Contextual Peek when approaching a real enemy threat in medium range (never on abstract round-start waypoints!)
                         if (EnableContextualPeeks &&
                             ctx.ActivePeek == PeekStyle.None &&
+                            (ctx.Threat.Type != ThreatType.TeamCallout || ctx.Threat.Priority >= 1.30f) &&
                             dist2D > 280.0f && dist2D < 680.0f &&
                             ctx.CurrentState != TacticalState.TacticalRetreat &&
                             ctx.CurrentState != TacticalState.TacticalHold &&
@@ -1621,6 +2154,21 @@ namespace BotProTactics
                 if (moveVel != null && speed2D > 40.0f)
                 {
                     float moveYaw = MathF.Atan2(moveVel.Y, moveVel.X) * (180.0f / MathF.PI);
+
+                    // Respect native CS2 hiding-spot checks (UpdateLookAround) when no threat memory is active,
+                    // as long as the bot's view stays within 80 deg of its movement direction (preventing backwards running)!
+                    if ((!ctx.Threat.Active || nowSec >= ctx.Threat.ExpireTime) && !ctx.HasCorridorPreAim && ccsBot != null)
+                    {
+                        if (ccsBot.LookAtSpotDuration > 0.05f || nowSec < ccsBot.LookAroundStateTimestamp)
+                        {
+                            float diffFromMove = MathF.Abs(NormalizeAngle(eyeAngles.Y - moveYaw));
+                            if (diffFromMove <= 80.0f)
+                            {
+                                return;
+                            }
+                        }
+                    }
+
                     float desiredYaw = ctx.HasCorridorPreAim ? ctx.CorridorPreAimYaw : moveYaw;
 
                     // If moving toward an active threat/TeamCallout around a corner (< 950u), bias forward pre-aim
@@ -1646,7 +2194,7 @@ namespace BotProTactics
                     {
                         // Fast turn recovery (540 deg/s) if view was facing > 65 deg away from movement vector
                         float turnSpeed = (angleDiff > 65.0f) ? 540.0f : 310.0f;
-                        ApplySmoothHumanAim(pawn, ccsBot, eyeAngles, desiredYaw, slopePitch, turnSpeed, 2.6f, dt, nowSec);
+                        ApplySmoothHumanAim(pawn, ccsBot, eyeAngles, desiredYaw, slopePitch, turnSpeed, 2.6f, dt, nowSec, lockLookAround: false);
                     }
                     return;
                 }
@@ -1669,13 +2217,17 @@ namespace BotProTactics
             float maxYawSpeedDegPerSec,
             float maxPitchStepDeg,
             float dt,
-            float nowSec)
+            float nowSec,
+            bool lockLookAround = true)
         {
             if (ccsBot != null)
             {
                 ccsBot.EyeAnglesUnderPathFinderControl = false;
-                ccsBot.InhibitLookAroundTimestamp = nowSec + 0.55f;
-                ccsBot.LookAtSpotDuration = 0.0f;
+                if (lockLookAround)
+                {
+                    ccsBot.InhibitLookAroundTimestamp = nowSec + 0.18f;
+                    ccsBot.LookAtSpotDuration = 0.0f;
+                }
             }
 
             float currentYaw = eyeAngles.Y;
@@ -1734,8 +2286,9 @@ namespace BotProTactics
             int enemyAlive = 0;
             int enemiesNearSpot = 0;
 
-            foreach (var p in Utilities.GetPlayers())
+            for (int slot = 0; slot < 64; slot++)
             {
+                var p = Utilities.GetPlayerFromSlot(slot);
                 if (p == null || !p.IsValid || !p.PawnIsAlive || p.Team == team) continue;
                 if (p.Team == CsTeam.CounterTerrorist || p.Team == CsTeam.Terrorist)
                 {
@@ -1757,8 +2310,9 @@ namespace BotProTactics
             //   ONLY bots on the SAME site/connector (dist <= 900u) react! The anchor on B stays on B!
             bool isFullRotateTrigger = (enemyAlive == 1 || _isBombPlanted || enemiesNearSpot >= 3);
 
-            foreach (var p in Utilities.GetPlayers())
+            for (int slot = 0; slot < 64; slot++)
             {
+                var p = Utilities.GetPlayerFromSlot(slot);
                 if (p == null || !p.IsValid || !p.IsBot || !p.PawnIsAlive || p.Team != team)
                     continue;
 
@@ -2074,18 +2628,44 @@ namespace BotProTactics
                     if (bPawn == null || !bPawn.IsValid || bPawn.AbsOrigin == null) continue;
 
                     float dist = Dist3D(ePos, bPawn.AbsOrigin);
-                    if (dist < 620.0f)
+                    float dz = MathF.Abs(ePos.Z - bPawn.AbsOrigin.Z);
+
+                    // Realism: Elevation difference (different floors / vertical levels) sharply attenuates footstep clarity
+                    float maxHearingDist = 620.0f;
+                    if (dz > 110.0f)
                     {
-                        var ctx = _agents[botSlot];
-                        if (!ctx.Threat.Active || ctx.Threat.Priority <= 0.75f || nowSec > ctx.Threat.ExpireTime)
+                        maxHearingDist = MathF.Max(260.0f, 620.0f - (dz * 2.8f));
+                    }
+                    if (dist >= maxHearingDist) continue;
+
+                    // Only perform RayTrace acoustic wall occlusion when beyond 380u (inside 380u footsteps are audible even through walls)
+                    if (dist > 380.0f)
+                    {
+                        var rayTrace = GetRayTrace();
+                        if (rayTrace != null)
                         {
-                            ctx.Threat.Set(ePos, nowSec + 0.95f, ThreatType.Footsteps, 0.75f);
+                            _traceStart ??= new Vector(0f, 0f, 0f);
+                            _traceEnd ??= new Vector(0f, 0f, 0f);
+                            _traceStart.X = bPawn.AbsOrigin.X; _traceStart.Y = bPawn.AbsOrigin.Y; _traceStart.Z = bPawn.AbsOrigin.Z + 60f;
+                            _traceEnd.X = ePos.X; _traceEnd.Y = ePos.Y; _traceEnd.Z = ePos.Z + 40f;
+                            var opts = new RayTraceAPI.TraceOptions(InteractionLayers.MASK_WORLD_ONLY, InteractionLayers.None, false);
+                            if (rayTrace.TraceEndShape(_traceStart, _traceEnd, null, opts, out RayTraceAPI.TraceResult traceRes) && traceRes.Fraction < 0.95f)
+                            {
+                                // Sound occluded by solid walls/ceilings beyond 380u -> inaudible
+                                continue;
+                            }
                         }
-                        if (dist < 550.0f)
-                        {
-                            ctx.HoldUntilSec = 0f;
-                            ctx.IsAnchoredOnSightline = false;
-                        }
+                    }
+
+                    var ctx = _agents[botSlot];
+                    if (!ctx.Threat.Active || ctx.Threat.Priority <= 0.75f || nowSec > ctx.Threat.ExpireTime)
+                    {
+                        ctx.Threat.Set(ePos, nowSec + 0.95f, ThreatType.Footsteps, 0.75f);
+                    }
+                    if (dist < 480.0f)
+                    {
+                        ctx.HoldUntilSec = 0f;
+                        ctx.IsAnchoredOnSightline = false;
                     }
                 }
             }
@@ -2114,12 +2694,17 @@ namespace BotProTactics
                     ctx.EquippedClass = WeaponClass.KnifeOrUtility;
             }
 
+            bool carriesC4 = false;
             if (weaponServices.MyWeapons != null)
             {
                 foreach (var handle in weaponServices.MyWeapons)
                 {
                     var wep = handle.Value;
                     if (wep == null || !wep.IsValid) continue;
+                    if (string.Equals(wep.DesignerName, "weapon_c4", StringComparison.OrdinalIgnoreCase))
+                    {
+                        carriesC4 = true;
+                    }
                     var vData = new CCSWeaponBase(wep.Handle).VData;
                     if (vData != null)
                     {
@@ -2136,6 +2721,7 @@ namespace BotProTactics
                     }
                 }
             }
+            ctx.IsC4Carrier = carriesC4;
         }
 
         private static void SuppressCombatJump(CCSPlayerPawn pawn, CCSBot? ccsBot, float nowSec)

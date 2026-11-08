@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using BotControllerApi;
 using CounterStrikeSharp.API;
@@ -63,6 +64,12 @@ public class BotState : BasePlugin
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
+        public static bool IsGrenadeThrowLocked(object api, int slot)
+        {
+            return (int)((IBotControllerApi)api).GetWeaponLock(slot) == 4;
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
         public static bool UnlockWeapon(object api, int slot)
         {
             return ((IBotControllerApi)api).Unlock(slot, (LockKind)2);
@@ -110,16 +117,50 @@ public class BotState : BasePlugin
 
     // Cached bot controllers updated every 4 ticks to avoid per-tick entity enumeration
     private readonly List<CCSPlayerController> _cachedControllers = new List<CCSPlayerController>(16);
+    private readonly List<CCSPlayerController> _cachedAllPlayers = new List<CCSPlayerController>(16);
     private int _tickCounter;
+    private static FieldInfo? _serverMaxPlayersField;
+
+    private static void ResetServerMaxPlayersCache()
+    {
+        try
+        {
+            _serverMaxPlayersField ??= typeof(Server).GetField("_maxPlayers", BindingFlags.NonPublic | BindingFlags.Static);
+            _serverMaxPlayersField?.SetValue(null, null);
+        }
+        catch
+        {
+        }
+    }
+
+    private void PopulateConnectedPlayers(List<CCSPlayerController> targetList, bool botsOnly)
+    {
+        targetList.Clear();
+        for (int slot = 0; slot < 64; slot++)
+        {
+            CCSPlayerController? p = Utilities.GetPlayerFromSlot(slot);
+            if (p != null && p.IsValid && (!botsOnly || p.IsBot))
+            {
+                targetList.Add(p);
+            }
+        }
+    }
 
     public override string ModuleName => "Smarter-Bot";
-    public override string ModuleVersion => "2.1.0";
+    public override string ModuleVersion => "2.2.0";
     public override string ModuleAuthor => "Antigravity, ed0ard & XBribo";
     public override string ModuleDescription => "Synchronized with BotProTactics: Zero-GC Flash Dodge with Yaw Restore, 8-Way RayTrace Unstuck & Reload Cancel";
 
     public override void Load(bool hotReload)
     {
+        ResetServerMaxPlayersCache();
         _smokeConVar = ConVar.Find("bot_max_visible_smoke_length");
+        RegisterListener<Listeners.OnMapStart>(_ =>
+        {
+            ResetServerMaxPlayersCache();
+            _cachedControllers.Clear();
+            _cachedAllPlayers.Clear();
+        });
         RegisterEventHandler<EventRoundStart>(OnRoundStart, HookMode.Post);
         RegisterEventHandler<EventPlayerHurt>(OnPlayerHurt, HookMode.Post);
         RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn, HookMode.Post);
@@ -134,7 +175,7 @@ public class BotState : BasePlugin
         RegisterListener<Listeners.OnEntitySpawned>(OnEntitySpawned);
         RegisterListener<Listeners.OnTick>(OnTick);
         _gunReequipTimer = AddTimer(1f, ReequipGunForActiveBots, TimerFlags.REPEAT);
-        Logger.LogInformation("[BotState] v2.1.0 Loaded! Zero-GC Flash Dodge, RayTrace Anti-Stuck, Crosshair Anchor active.");
+        Logger.LogInformation("[BotState] v2.2.0 Loaded! Zero-GC Flash Dodge, RayTrace Anti-Stuck, Crosshair Anchor, Slot64 Scan active.");
     }
 
     public override void OnAllPluginsLoaded(bool hotReload)
@@ -294,10 +335,12 @@ public class BotState : BasePlugin
 
     public HookResult OnRoundFreezeEnd(EventRoundFreezeEnd @event, GameEventInfo info)
     {
+        ResetServerMaxPlayersCache();
         _isFreezeTime = false;
         SetSmokeLength(0f);
-        foreach (CCSPlayerController item in Utilities.GetPlayers())
+        for (int slot = 0; slot < 64; slot++)
         {
+            CCSPlayerController? item = Utilities.GetPlayerFromSlot(slot);
             if (item != null && item.IsValid && item.IsBot)
             {
                 ApplyBotState(item);
@@ -310,7 +353,8 @@ public class BotState : BasePlugin
     {
         try
         {
-            if (!string.IsNullOrEmpty(Server.MapName))
+            string? mapName = Server.MapName;
+            if (!string.IsNullOrEmpty(mapName) && !string.Equals(mapName, "<empty>", StringComparison.OrdinalIgnoreCase))
             {
                 OnTickCore();
             }
@@ -324,14 +368,7 @@ public class BotState : BasePlugin
     {
         if (_tickCounter % 4 == 0 || _cachedControllers.Count == 0)
         {
-            _cachedControllers.Clear();
-            foreach (CCSPlayerController p in Utilities.GetPlayers())
-            {
-                if (p != null && p.IsValid && p.IsBot)
-                {
-                    _cachedControllers.Add(p);
-                }
-            }
+            PopulateConnectedPlayers(_cachedControllers, botsOnly: true);
         }
         _tickCounter++;
     }
@@ -550,6 +587,7 @@ public class BotState : BasePlugin
 
     private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
     {
+        ResetServerMaxPlayersCache();
         ReleaseKnifeLocks();
         SetSmokeLength(0f);
         _eliminationHandled = false;
@@ -567,7 +605,8 @@ public class BotState : BasePlugin
         _flashThrownAt.Clear();
         _flashRolledByBot.Clear();
         _flashDecisions.Clear();
-        Logger.LogInformation("[BotState] Round Start - bot state caches and anti-stuck tracking reset.");
+        PopulateConnectedPlayers(_cachedControllers, botsOnly: true);
+        Logger.LogInformation("[BotState] Round Start - {BotCount} bots active, state caches and anti-stuck tracking reset.", _cachedControllers.Count);
         return HookResult.Continue;
     }
 
@@ -608,7 +647,8 @@ public class BotState : BasePlugin
         {
             return;
         }
-        List<CCSPlayerController> players = Utilities.GetPlayers()
+        PopulateConnectedPlayers(_cachedAllPlayers, botsOnly: false);
+        List<CCSPlayerController> players = _cachedAllPlayers
             .Where(p => p != null && p.IsValid && !p.IsHLTV && (p.TeamNum == 2 || p.TeamNum == 3))
             .ToList();
 
@@ -712,8 +752,9 @@ public class BotState : BasePlugin
 
     private HookResult OnBombPlanted(EventBombPlanted @event, GameEventInfo info)
     {
-        foreach (CCSPlayerController item in Utilities.GetPlayers())
+        for (int slot = 0; slot < 64; slot++)
         {
+            CCSPlayerController? item = Utilities.GetPlayerFromSlot(slot);
             if (item != null && item.IsValid && item.IsBot && !item.HasBeenControlledByPlayerThisRound)
             {
                 CCSPlayerPawn? pawn = item.PlayerPawn?.Value;
@@ -832,7 +873,8 @@ public class BotState : BasePlugin
         {
             return;
         }
-        List<CCSPlayerController> players = Utilities.GetPlayers();
+        PopulateConnectedPlayers(_cachedAllPlayers, botsOnly: false);
+        List<CCSPlayerController> players = _cachedAllPlayers;
         int aliveT = 0;
         int aliveCT = 0;
         foreach (CCSPlayerController item in players)
@@ -939,7 +981,28 @@ public class BotState : BasePlugin
         {
             pawn.Bot.LookYaw = newYaw;
             pawn.Bot.LookAroundStateTimestamp = Server.CurrentTime + 0.35f;
+            if (pawn.Bot.IsAvoidingGrenade != null)
+            {
+                pawn.Bot.IsAvoidingGrenade.Duration = 0.08f;
+                pawn.Bot.IsAvoidingGrenade.Timestamp = Server.CurrentTime + 0.08f;
+            }
         }
+    }
+
+    private static bool SmoothTurnBotYaw(CCSPlayerPawn pawn, float targetYaw, float maxStepDeg = 28f)
+    {
+        if (pawn.EyeAngles == null) return true;
+        float currentYaw = pawn.EyeAngles.Y;
+        float diff = (float)NormalizeAngleDeg(targetYaw - currentYaw);
+        if (MathF.Abs(diff) <= 5f)
+        {
+            SetBotYaw(pawn, targetYaw);
+            return true;
+        }
+        float step = Math.Clamp(diff, -maxStepDeg, maxStepDeg);
+        float nextYaw = (float)NormalizeAngleDeg(currentYaw + step);
+        SetBotYaw(pawn, nextYaw);
+        return MathF.Abs((float)NormalizeAngleDeg(targetYaw - nextYaw)) <= 5f;
     }
 
     private void ProcessFlashbangAvoidance()
@@ -960,7 +1023,7 @@ public class BotState : BasePlugin
             }
         }
 
-        // First: check if any bot needs its SavedYaw restored after a flashbang popped!
+        // First: smoothly restore SavedYaw across multiple ticks after a flashbang popped!
         if (_flashDecisions.Count > 0)
         {
             List<(int bot, uint flash)> keysToRemove = new List<(int bot, uint flash)>();
@@ -969,23 +1032,42 @@ public class BotState : BasePlugin
             foreach (var kvp in _flashDecisions)
             {
                 FlashDecision dec = kvp.Value;
-                if (dec.TurnedAway && !dec.RestoredYaw && now >= dec.DetonateAt + 0.05f)
+                if (dec.TurnedAway && !dec.RestoredYaw && now >= dec.DetonateAt + 0.04f)
                 {
-                    dec.RestoredYaw = true;
-                    keysToUpdate.Add((kvp.Key, dec));
+                    bool doneRestoring = (now >= dec.DetonateAt + 0.30f);
+                    bool foundBot = false;
 
                     for (int b = 0; b < _cachedControllers.Count; b++)
                     {
                         CCSPlayerController botCtrl = _cachedControllers[b];
                         if (botCtrl != null && botCtrl.IsValid && (int)botCtrl.Index == kvp.Key.Item1)
                         {
+                            foundBot = true;
+                            if (_botController != null && botCtrl.Slot >= 0 && BotControllerBridge.IsGrenadeThrowLocked(_botController, botCtrl.Slot))
+                            {
+                                doneRestoring = true;
+                                break;
+                            }
                             CCSPlayerPawn? pawn = botCtrl.PlayerPawn?.Value;
                             if (pawn != null && pawn.IsValid && pawn.LifeState == 0 && (pawn.Bot == null || !pawn.Bot.IsEnemyVisible))
                             {
-                                SetBotYaw(pawn, dec.SavedYaw);
+                                if (SmoothTurnBotYaw(pawn, dec.SavedYaw, 26f))
+                                {
+                                    doneRestoring = true;
+                                }
+                            }
+                            else
+                            {
+                                doneRestoring = true;
                             }
                             break;
                         }
+                    }
+
+                    if (!foundBot || doneRestoring)
+                    {
+                        dec.RestoredYaw = true;
+                        keysToUpdate.Add((kvp.Key, dec));
                     }
                 }
                 if (now - dec.DetonateAt > 1.5f)
@@ -1013,6 +1095,10 @@ public class BotState : BasePlugin
         {
             CCSPlayerController botCtrl = _cachedControllers[b];
             if (botCtrl == null || !botCtrl.IsValid || !botCtrl.IsBot || botCtrl.HasBeenControlledByPlayerThisRound)
+            {
+                continue;
+            }
+            if (_botController != null && botCtrl.Slot >= 0 && BotControllerBridge.IsGrenadeThrowLocked(_botController, botCtrl.Slot))
             {
                 continue;
             }
@@ -1067,8 +1153,11 @@ public class BotState : BasePlugin
                     {
                         dec.TurnedAway = true;
                         dec.SavedYaw = pawn.EyeAngles.Y;
+                    }
+                    if (dec.TurnedAway && !dec.RestoredYaw && now <= detonateAt)
+                    {
                         float dodgeYaw = (float)NormalizeAngleDeg(dec.SavedYaw + 150.0);
-                        SetBotYaw(pawn, dodgeYaw);
+                        SmoothTurnBotYaw(pawn, dodgeYaw, 28f);
                     }
                     _flashDecisions[key] = dec;
                 }
@@ -1079,8 +1168,16 @@ public class BotState : BasePlugin
                         continue;
                     }
                     rolledSet.Add(flashIdx);
+                    byte humanTeam = GetHumanTeam();
+                    bool isAllyOfHuman = (humanTeam != 0 && botCtrl.TeamNum == humanTeam);
+
                     float msLeft = (detonateAt - now) * 1000f;
                     double dodgeProb = (msLeft <= 160f) ? 0.15 : ((msLeft <= 260f) ? 0.45 : ((msLeft <= 420f) ? 0.72 : 0.88));
+                    if (isAllyOfHuman)
+                    {
+                        // Ally bots dodge flashbangs at human-like rates (max ~48%), allowing enemy execute flashes to blind them
+                        dodgeProb *= 0.55;
+                    }
                     if (pawn.Bot != null && pawn.Bot.IsEnemyVisible)
                     {
                         dodgeProb *= 0.25;
@@ -1091,7 +1188,7 @@ public class BotState : BasePlugin
                     if (turnNow)
                     {
                         float dodgeYaw = (float)NormalizeAngleDeg(savedYaw + 150.0);
-                        SetBotYaw(pawn, dodgeYaw);
+                        SmoothTurnBotYaw(pawn, dodgeYaw, 28f);
                     }
                     _flashDecisions[key] = new FlashDecision
                     {
@@ -1156,5 +1253,18 @@ public class BotState : BasePlugin
         RayTraceAPI.TraceResult res = default;
         _rayTrace.TraceEndShape(_scratchEye, target, pawn, opts, out res);
         return res.Fraction >= 0.999f;
+    }
+
+    private byte GetHumanTeam()
+    {
+        for (int i = 0; i < _cachedAllPlayers.Count; i++)
+        {
+            CCSPlayerController p = _cachedAllPlayers[i];
+            if (p != null && p.IsValid && !p.IsBot && !p.IsHLTV && (p.TeamNum == 2 || p.TeamNum == 3))
+            {
+                return p.TeamNum;
+            }
+        }
+        return 0;
     }
 }

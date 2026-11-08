@@ -17,10 +17,12 @@ using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Capabilities;
 using CounterStrikeSharp.API.Modules.Commands;
 using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using RayTraceAPI;
+using BotControllerApi;
 
 namespace NadeSystem;
 
@@ -62,6 +64,9 @@ public class GrenadeData
 	public string TeamTag { get; set; } = "";
 
 	[JsonIgnore]
+	public bool AutoTagged { get; set; }
+
+	[JsonIgnore]
 	public float ZoneX => ProjectilePosition.X;
 
 	[JsonIgnore]
@@ -75,11 +80,11 @@ public class GrenadeData
 	{
 		get
 		{
-			if (!string.Equals(GrenadeType, "smoke", StringComparison.OrdinalIgnoreCase))
+			if (string.Equals(GrenadeType, "smoke", StringComparison.OrdinalIgnoreCase))
 			{
-				return 110f;
+				return 115f;
 			}
-			return 155f;
+			return 95f;
 		}
 	}
 }
@@ -103,6 +108,10 @@ public class NadeSystemPlugin : BasePlugin
 {
 	private readonly record struct SoundPoint(float X, float Y, float Z, float Timestamp, bool IsSniper);
 
+	private readonly record struct ActiveWindup(int Slot, float Yaw, float Pitch, float ExpiresAt);
+
+	private readonly Dictionary<int, ActiveWindup> _activeWindups = new Dictionary<int, ActiveWindup>();
+
 	private const float GRENADE_EFF_GRAVITY = 360f;
 
 	private const float MAX_THROW_SPEED = 1040f;
@@ -118,6 +127,8 @@ public class NadeSystemPlugin : BasePlugin
 	private readonly List<CooldownEntry> _cooldowns = new List<CooldownEntry>();
 
 	private readonly HashSet<uint> _replayBots = new HashSet<uint>();
+
+	private readonly Dictionary<string, float> _pendingWindupLineups = new Dictionary<string, float>();
 
 	private readonly HashSet<uint> _smokeCooldownBots = new HashSet<uint>();
 
@@ -138,6 +149,335 @@ public class NadeSystemPlugin : BasePlugin
 	private readonly Dictionary<uint, float> _dynamicNadeCooldownByBot = new Dictionary<uint, float>();
 
 	private static readonly PluginCapability<CRayTraceInterface> _rayTraceCapability = new PluginCapability<CRayTraceInterface>("raytrace:craytraceinterface");
+
+	private static readonly PluginCapability<IBotControllerApi> _controllerCap = new PluginCapability<IBotControllerApi>("botcontroller:api");
+
+	private IBotControllerApi? GetControllerApi()
+	{
+		try
+		{
+			return _controllerCap.Get();
+		}
+		catch
+		{
+			return null;
+		}
+	}
+
+	private Vector _tSpawnCenter = new Vector(0f, 0f, 0f);
+	private Vector _ctSpawnCenter = new Vector(0f, 0f, 0f);
+	private bool _spawnsResolved = false;
+	private bool _spawnsFromEntities = false;
+
+	private void ResolveMapSpawns()
+	{
+		_spawnsResolved = false;
+		_spawnsFromEntities = false;
+		try
+		{
+			var tSpawns = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("info_player_terrorist").ToList();
+			var ctSpawns = Utilities.FindAllEntitiesByDesignerName<CBaseEntity>("info_player_counterterrorist").ToList();
+
+			if (tSpawns.Count > 0 && ctSpawns.Count > 0)
+			{
+				float tx = 0, ty = 0, tz = 0;
+				foreach (var s in tSpawns)
+				{
+					if (s.AbsOrigin != null) { tx += s.AbsOrigin.X; ty += s.AbsOrigin.Y; tz += s.AbsOrigin.Z; }
+				}
+				_tSpawnCenter = new Vector(tx / tSpawns.Count, ty / tSpawns.Count, tz / tSpawns.Count);
+
+				float cx = 0, cy = 0, cz = 0;
+				foreach (var s in ctSpawns)
+				{
+					if (s.AbsOrigin != null) { cx += s.AbsOrigin.X; cy += s.AbsOrigin.Y; cz += s.AbsOrigin.Z; }
+				}
+				_ctSpawnCenter = new Vector(cx / ctSpawns.Count, cy / ctSpawns.Count, cz / ctSpawns.Count);
+				_spawnsResolved = true;
+				_spawnsFromEntities = true;
+				Logger.LogInformation("[NadeSystem] Dynamic map spawns resolved: T({TX:F0},{TY:F0}) CT({CX:F0},{CY:F0})", _tSpawnCenter.X, _tSpawnCenter.Y, _ctSpawnCenter.X, _ctSpawnCenter.Y);
+				return;
+			}
+		}
+		catch { }
+
+		string map = (Server.MapName ?? "").ToLowerInvariant();
+		if (map.Contains("mirage"))
+		{
+			_tSpawnCenter = new Vector(1200f, -200f, -100f);
+			_ctSpawnCenter = new Vector(-1680f, -1950f, -160f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("inferno"))
+		{
+			_tSpawnCenter = new Vector(-1800f, 380f, 50f);
+			_ctSpawnCenter = new Vector(2400f, 1800f, 160f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("dust2"))
+		{
+			_tSpawnCenter = new Vector(0f, -700f, 100f);
+			_ctSpawnCenter = new Vector(-1000f, 2200f, 50f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("anubis"))
+		{
+			_tSpawnCenter = new Vector(-700f, -1500f, 50f);
+			_ctSpawnCenter = new Vector(200f, 2200f, 50f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("ancient"))
+		{
+			_tSpawnCenter = new Vector(-2000f, 0f, 50f);
+			_ctSpawnCenter = new Vector(1800f, 0f, 50f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("nuke"))
+		{
+			_tSpawnCenter = new Vector(-3200f, -900f, -400f);
+			_ctSpawnCenter = new Vector(3200f, -900f, -400f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("vertigo"))
+		{
+			_tSpawnCenter = new Vector(-1400f, -1200f, 11700f);
+			_ctSpawnCenter = new Vector(-1000f, 600f, 11700f);
+			_spawnsResolved = true;
+		}
+		else if (map.Contains("overpass"))
+		{
+			_tSpawnCenter = new Vector(-2200f, 400f, 480f);
+			_ctSpawnCenter = new Vector(-2600f, 5200f, 450f);
+			_spawnsResolved = true;
+		}
+	}
+
+	private static bool HasGrenadeInInventory(CCSPlayerPawn pawn, string gtype, out string weaponName, out int itemDefIndex)
+	{
+		weaponName = "";
+		itemDefIndex = 0;
+		if (pawn == null || !pawn.IsValid || pawn.WeaponServices == null) return false;
+
+		string targetName = gtype.ToLowerInvariant() switch
+		{
+			"smoke" => "weapon_smokegrenade",
+			"flash" => "weapon_flashbang",
+			"he" => "weapon_hegrenade",
+			"molotov" => "weapon_molotov",
+			"incgrenade" => "weapon_incgrenade",
+			"decoy" => "weapon_decoy",
+			_ => ""
+		};
+
+		foreach (var handle in pawn.WeaponServices.MyWeapons)
+		{
+			var weapon = handle.Value;
+			if (weapon == null || !weapon.IsValid) continue;
+			string designer = weapon.DesignerName ?? "";
+			if (string.Equals(designer, targetName, StringComparison.OrdinalIgnoreCase) ||
+				(targetName == "weapon_molotov" && string.Equals(designer, "weapon_incgrenade", StringComparison.OrdinalIgnoreCase)) ||
+				(targetName == "weapon_incgrenade" && string.Equals(designer, "weapon_molotov", StringComparison.OrdinalIgnoreCase)))
+			{
+				if (string.Equals(designer, "weapon_flashbang", StringComparison.OrdinalIgnoreCase))
+				{
+					byte? ammoType = weapon.VData?.PrimaryAmmoType;
+					if (ammoType.HasValue && ammoType.Value < 32 && pawn.WeaponServices.Ammo[ammoType.Value] <= 0)
+					{
+						continue;
+					}
+				}
+				weaponName = designer;
+				itemDefIndex = designer switch
+				{
+					"weapon_flashbang" => 43,
+					"weapon_hegrenade" => 44,
+					"weapon_smokegrenade" => 45,
+					"weapon_molotov" => 46,
+					"weapon_decoy" => 47,
+					"weapon_incgrenade" => 48,
+					_ => 45
+				};
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static void ConsumeGrenade(CCSPlayerController bot, string weaponDesignerName)
+	{
+		CCSPlayerPawn? pawn = bot.PlayerPawn?.Value;
+		if (pawn == null || !pawn.IsValid || pawn.WeaponServices == null) return;
+
+		foreach (var handle in pawn.WeaponServices.MyWeapons)
+		{
+			var weapon = handle.Value;
+			if (weapon == null || !weapon.IsValid) continue;
+			if (string.Equals(weapon.DesignerName, weaponDesignerName, StringComparison.OrdinalIgnoreCase))
+			{
+				if (string.Equals(weaponDesignerName, "weapon_flashbang", StringComparison.OrdinalIgnoreCase))
+				{
+					byte? ammoType = weapon.VData?.PrimaryAmmoType;
+					if (ammoType.HasValue && ammoType.Value < 32)
+					{
+						Span<ushort> ammo = pawn.WeaponServices.Ammo;
+						ushort currentAmmo = ammo[ammoType.Value];
+						if (currentAmmo > 1)
+						{
+							ammo[ammoType.Value] = (ushort)(currentAmmo - 1);
+							Utilities.SetStateChanged(pawn, "CBasePlayerPawn", "m_pWeaponServices", Schema.GetSchemaOffset("CPlayer_WeaponServices", "m_iAmmo"));
+							return;
+						}
+					}
+					else if (weapon.Clip1 > 1)
+					{
+						weapon.Clip1--;
+						Utilities.SetStateChanged(weapon, "CBasePlayerWeapon", "m_iClip1");
+						return;
+					}
+				}
+				Utilities.RemoveItemByDesignerName(bot, weaponDesignerName);
+				return;
+			}
+		}
+	}
+
+	private bool HasForwardClearance(Vector eyePos, float yawDeg, float pitchDeg, float checkDist = 36f)
+	{
+		try
+		{
+			CRayTraceInterface rt = _rayTraceCapability.Get();
+			if (rt == null) return true;
+			float yawRad = yawDeg * (MathF.PI / 180f);
+			float pitchRad = -pitchDeg * (MathF.PI / 180f);
+			float cosP = MathF.Cos(pitchRad);
+			float dx = cosP * MathF.Cos(yawRad);
+			float dy = cosP * MathF.Sin(yawRad);
+			float dz = MathF.Sin(pitchRad);
+			_traceA ??= new Vector(0f, 0f, 0f);
+			_traceB ??= new Vector(0f, 0f, 0f);
+			_traceA.X = eyePos.X; _traceA.Y = eyePos.Y; _traceA.Z = eyePos.Z;
+			_traceB.X = eyePos.X + dx * checkDist;
+			_traceB.Y = eyePos.Y + dy * checkDist;
+			_traceB.Z = eyePos.Z + dz * checkDist;
+			RayTraceAPI.TraceOptions opt = new RayTraceAPI.TraceOptions((InteractionLayers)2109441, (InteractionLayers)0, false);
+			if (rt.TraceEndShape(_traceA, _traceB, null, opt, out RayTraceAPI.TraceResult res))
+			{
+				return res.Fraction >= 0.85f;
+			}
+			return true;
+		}
+		catch { return true; }
+	}
+
+	private void ReleaseBotThrowLocks(int slot, bool unlockWeapon = true)
+	{
+		_activeWindups.Remove(slot);
+		if (slot < 0) return;
+		var api = GetControllerApi();
+		if (api != null)
+		{
+			api.Unlock(slot, LockKind.Aim);
+			if (unlockWeapon)
+			{
+				api.Unlock(slot, LockKind.Weapon);
+			}
+		}
+	}
+
+	private void ReleaseAllThrowLocks()
+	{
+		if (_activeWindups.Count == 0) return;
+		var api = GetControllerApi();
+		if (api != null)
+		{
+			foreach (int s in _activeWindups.Keys)
+			{
+				if (s >= 0)
+				{
+					api.Unlock(s, LockKind.Aim);
+					api.Unlock(s, LockKind.Weapon);
+				}
+			}
+		}
+		_activeWindups.Clear();
+	}
+
+	private void ProcessActiveWindups()
+	{
+		if (_activeWindups.Count == 0) return;
+		float now = Server.CurrentTime;
+		List<int>? expired = null;
+
+		foreach (var kvp in _activeWindups)
+		{
+			ActiveWindup w = kvp.Value;
+			if (now >= w.ExpiresAt)
+			{
+				expired ??= new List<int>(4);
+				expired.Add(kvp.Key);
+				continue;
+			}
+			CCSPlayerController? bot = Utilities.GetPlayerFromSlot(w.Slot);
+			CCSPlayerPawn? pawn = bot?.PlayerPawn?.Value;
+			if (bot == null || !bot.IsValid || !bot.PawnIsAlive || pawn == null || !pawn.IsValid)
+			{
+				expired ??= new List<int>(4);
+				expired.Add(kvp.Key);
+				continue;
+			}
+			if (pawn.AbsVelocity != null)
+			{
+				pawn.AbsVelocity.X *= 0.25f;
+				pawn.AbsVelocity.Y *= 0.25f;
+			}
+			if (pawn.EyeAngles != null)
+			{
+				pawn.EyeAngles.Y = w.Yaw;
+				pawn.EyeAngles.X = w.Pitch;
+			}
+			if (pawn.V_angle != null)
+			{
+				pawn.V_angle.Y = w.Yaw;
+				pawn.V_angle.X = w.Pitch;
+			}
+			if (pawn.Bot != null)
+			{
+				pawn.Bot.ForwardSpeed = 0f;
+				pawn.Bot.LeftSpeed = 0f;
+				pawn.Bot.LookYaw = w.Yaw;
+				pawn.Bot.LookPitch = w.Pitch;
+			}
+		}
+
+		if (expired != null)
+		{
+			for (int i = 0; i < expired.Count; i++)
+			{
+				ReleaseBotThrowLocks(expired[i], unlockWeapon: true);
+			}
+		}
+	}
+
+	private bool HasReleaseLoS(float eyeX, float eyeY, float eyeZ, Vec3 release)
+	{
+		try
+		{
+			CRayTraceInterface rt = _rayTraceCapability.Get();
+			if (rt == null) return true;
+			_traceA ??= new Vector(0f, 0f, 0f);
+			_traceB ??= new Vector(0f, 0f, 0f);
+			_traceA.X = eyeX; _traceA.Y = eyeY; _traceA.Z = eyeZ;
+			_traceB.X = release.X; _traceB.Y = release.Y; _traceB.Z = release.Z;
+			RayTraceAPI.TraceOptions opt = new RayTraceAPI.TraceOptions((InteractionLayers)2109441, (InteractionLayers)0, false);
+			RayTraceAPI.TraceResult res = default;
+			if (rt.TraceEndShape(_traceA, _traceB, null, opt, out res))
+			{
+				return res.Fraction >= 0.88f;
+			}
+			return true;
+		}
+		catch { return true; }
+	}
 
 	private bool _defuseSmokeUsed;
 
@@ -173,7 +513,7 @@ public class NadeSystemPlugin : BasePlugin
 
 	private string _loadedMapName = "";
 
-	private static readonly float[] CandidateFlightTimes = new float[5] { 0.65f, 0.85f, 1.05f, 1.28f, 1.52f };
+	private static readonly float[] CandidateFlightTimes = new float[7] { 0.65f, 0.85f, 1.05f, 1.28f, 1.52f, 1.85f, 2.25f };
 
 	private static readonly Dictionary<string, float> CooldownSec = new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase)
 	{
@@ -210,9 +550,23 @@ public class NadeSystemPlugin : BasePlugin
 
 	private static readonly MemoryFunctionWithReturn<nint, nint, nint, nint, nint, int, CMolotovProjectile> _molotovCreate = new MemoryFunctionWithReturn<nint, nint, nint, nint, nint, int, CMolotovProjectile>(RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 49 89 FC 53 48 81 EC ? ? ? ? 4C 8D 35" : "48 8B C4 48 89 58 08 48 89 70 10 48 89 78 20 4C 89 40 18 55 41 54 41 55 41 56 41 57 48 8D 6C 24 90 48 81 EC 70 01 00 00");
 
+	private static readonly FieldInfo? _serverMaxPlayersField =
+		typeof(Server).GetField("_maxPlayers", BindingFlags.NonPublic | BindingFlags.Static);
+
+	private static void ResetServerMaxPlayersCache()
+	{
+		try
+		{
+			_serverMaxPlayersField?.SetValue(null, null);
+		}
+		catch
+		{
+		}
+	}
+
 	public override string ModuleName => "NadeSystem";
 
-	public override string ModuleVersion => "2.1.0";
+	public override string ModuleVersion => "3.0.0";
 
 	public override string ModuleAuthor => "Antigravity & ed0ard";
 
@@ -244,16 +598,18 @@ public class NadeSystemPlugin : BasePlugin
 		((BasePlugin)this).RegisterEventHandler<EventPlayerJump>((GameEventHandler<EventPlayerJump>)OnPlayerJump, (HookMode)1);
 		((BasePlugin)this).RegisterListener<Listeners.OnMapStart>(delegate(string mapName)
 		{
+			ResetServerMaxPlayersCache();
 			_db.Clear();
 			LoadDbFilesOnly();
 			RefreshMapNades(mapName);
 			_cooldowns.Clear();
+			_pendingWindupLineups.Clear();
 			_roundCountByTeam.Clear();
 			_replayBots.Clear();
 		});
 		((BasePlugin)this).AddCommand("bot_nades", "Control bots' nade throw mode (off/less/normal/more/max)", CmdBotNades);
 		RefreshMapNades(Server.MapName);
-		Logger.LogInformation("[NadeSystem] v2.1.0 Loaded - {DbCount} map lineups in DB. Active map '{Map}' has {Count} lineups ready.", _db.Count, _loadedMapName, _mapNades?.Count ?? 0);
+		Logger.LogInformation("[NadeSystem] v2.2.0 Loaded - {DbCount} map lineups in DB. Active map '{Map}' has {Count} lineups ready.", _db.Count, _loadedMapName, _mapNades?.Count ?? 0);
 	}
 
 	private void LoadDbFilesOnly()
@@ -315,7 +671,46 @@ public class NadeSystemPlugin : BasePlugin
 		{
 			_loadedMapName = targetMap;
 			_mapNades = _db.Where((GrenadeData g) => string.Equals(g.MapName, targetMap, StringComparison.OrdinalIgnoreCase)).ToList();
-			Logger.LogInformation("[NadeSystem] Active map '{Map}': {Count} lineups ready.", targetMap, _mapNades.Count);
+
+			ResolveMapSpawns();
+			if (_spawnsResolved)
+			{
+				float teamAxisX = _ctSpawnCenter.X - _tSpawnCenter.X;
+				float teamAxisY = _ctSpawnCenter.Y - _tSpawnCenter.Y;
+
+				int autoTagged = 0;
+				foreach (var g in _mapNades)
+				{
+					if (string.IsNullOrEmpty(g.TeamTag) || g.AutoTagged)
+					{
+						float distT = Dist3D(g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z, _tSpawnCenter.X, _tSpawnCenter.Y, _tSpawnCenter.Z);
+						float distCT = Dist3D(g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z, _ctSpawnCenter.X, _ctSpawnCenter.Y, _ctSpawnCenter.Z);
+
+						if (distT < distCT * 0.85f)
+						{
+							g.TeamTag = "T";
+						}
+						else if (distCT < distT * 0.85f)
+						{
+							g.TeamTag = "CT";
+						}
+						else
+						{
+							float throwDirX = g.LandingPosition.X - g.ProjectilePosition.X;
+							float throwDirY = g.LandingPosition.Y - g.ProjectilePosition.Y;
+							float dot = throwDirX * teamAxisX + throwDirY * teamAxisY;
+							g.TeamTag = dot >= 0 ? "T" : "CT";
+						}
+						g.AutoTagged = true;
+						autoTagged++;
+					}
+				}
+				Logger.LogInformation("[NadeSystem] Active map '{Map}': {Count} lineups ready ({Auto} auto-classified with team tags).", targetMap, _mapNades.Count, autoTagged);
+			}
+			else
+			{
+				Logger.LogInformation("[NadeSystem] Active map '{Map}': {Count} lineups ready.", targetMap, _mapNades.Count);
+			}
 		}
 	}
 
@@ -357,7 +752,7 @@ public class NadeSystemPlugin : BasePlugin
 		float num2 = targetPos.Y - startPos.Y;
 		float num3 = targetPos.Z - startPos.Z;
 		float num4 = MathF.Sqrt(num * num + num2 * num2);
-		if (num4 < 180f || num4 > 2100f)
+		if (num4 < 180f || num4 > 2850f)
 		{
 			return false;
 		}
@@ -533,7 +928,7 @@ public class NadeSystemPlugin : BasePlugin
 		int teamNum = ((CBaseEntity)bot).TeamNum;
 		foreach (CCSPlayerController allController in allControllers)
 		{
-			if (!((CEntityInstance)allController).IsValid || !allController.PawnIsAlive || ((CBaseEntity)allController).TeamNum == teamNum || (!HasInformationOn(allController, bot) && !PlayerMadeAudibleSound(allController)))
+			if (!((CEntityInstance)allController).IsValid || !allController.PawnIsAlive || ((CBaseEntity)allController).TeamNum == teamNum || !TeamHasInformationOn(bot, allController, allControllers))
 			{
 				continue;
 			}
@@ -660,12 +1055,8 @@ public class NadeSystemPlugin : BasePlugin
 
 	private bool CanTeamAffordAndAllow(CCSPlayerController bot, string gtype, List<CCSPlayerController> allControllers)
 	{
-		CCSPlayerController_InGameMoneyServices inGameMoneyServices = bot.InGameMoneyServices;
-		if (inGameMoneyServices == null)
-		{
-			return false;
-		}
-		if (!((((CBaseEntity)bot).TeamNum == 3) ? CostCT : CostT).TryGetValue(gtype, out var value) || inGameMoneyServices.Account < value)
+		CCSPlayerPawn? pawn = bot.PlayerPawn?.Value;
+		if (pawn == null || !pawn.IsValid || !HasGrenadeInInventory(pawn, gtype, out _, out _))
 		{
 			return false;
 		}
@@ -737,44 +1128,31 @@ public class NadeSystemPlugin : BasePlugin
 				float x = pos.Z + num - mapNade.ProjectilePosition.Z;
 				if (grenadeType == "decoy")
 				{
-					if (_botNadesMode != "off" && !IsOnCooldown(mapNade.Id) && num2 * num2 + num3 * num3 <= 40000f && MathF.Abs(x) <= 85f)
+					if (_botNadesMode != "off" && !IsOnCooldown(mapNade.Id) && !IsLineupPending(mapNade.Id) && num2 * num2 + num3 * num3 <= 2500f && MathF.Abs(x) <= 75f && HasGrenadeInInventory(val, "decoy", out string decWName, out int decDef) && HasReleaseLoS(pos.X, pos.Y, pos.Z + num, mapNade.ProjectilePosition))
 					{
 						RegisterCooldown(mapNade.Id, "decoy");
-						SpawnProjectile(bot, mapNade);
+						ExecuteRealisticThrow(bot, mapNade, decWName, decDef);
 						flag3 = true;
 						break;
 					}
 					continue;
 				}
-				if (num2 * num2 + num3 * num3 > mapNade.ZoneRadius * mapNade.ZoneRadius || MathF.Abs(x) > 85f || IsOnCooldown(mapNade.Id) || ((grenadeType == "he" || grenadeType == "molotov" || grenadeType == "flash") && IsOnProbFailCooldown(mapNade.Id)) || (grenadeType == "smoke" && _smokeCooldownBots.Contains(((CEntityInstance)bot).Index)) || (grenadeType == "smoke" && !IsNoActiveSmokeNear(mapNade.LandingPosition.X, mapNade.LandingPosition.Y, mapNade.LandingPosition.Z, 120f)) || !((((CBaseEntity)bot).TeamNum == 2) ? flag : flag2))
+				if (num2 * num2 + num3 * num3 > mapNade.ZoneRadius * mapNade.ZoneRadius || MathF.Abs(x) > 75f || IsOnCooldown(mapNade.Id) || IsLineupPending(mapNade.Id) || ((grenadeType == "he" || grenadeType == "molotov" || grenadeType == "flash") && IsOnProbFailCooldown(mapNade.Id)) || (grenadeType == "smoke" && _smokeCooldownBots.Contains(((CEntityInstance)bot).Index)) || (grenadeType == "smoke" && !IsNoActiveSmokeNear(mapNade.LandingPosition.X, mapNade.LandingPosition.Y, mapNade.LandingPosition.Z, 120f)) || !((((CBaseEntity)bot).TeamNum == 2) ? flag : flag2))
 				{
 					continue;
 				}
-				bool num4;
-				if (!(_botNadesMode == "normal") && !(_botNadesMode == "more") && !(_botNadesMode == "less"))
-				{
-					num4 = grenadeType == "smoke";
-				}
-				else
-				{
-					if (grenadeType == "smoke")
-					{
-						goto IL_03f0;
-					}
-					num4 = grenadeType == "flash";
-				}
-				if (num4)
-				{
-					goto IL_03f0;
-				}
-				goto IL_03fe;
-				IL_03f0:
-				if (!FacesThrowDirection(val, mapNade))
+				if (!string.IsNullOrEmpty(mapNade.TeamTag) && mapNade.TeamTag != ((((CBaseEntity)bot).TeamNum == 3) ? "CT" : "T"))
 				{
 					continue;
 				}
-				goto IL_03fe;
-				IL_03fe:
+				if (!HasGrenadeInInventory(val, grenadeType, out _, out _))
+				{
+					continue;
+				}
+				if (!HasReleaseLoS(pos.X, pos.Y, pos.Z + num, mapNade.ProjectilePosition))
+				{
+					continue;
+				}
 				if (_botNadesMode == "max")
 				{
 					if ((grenadeType == "flash" && CanBlindAnyEnemy(bot, mapNade, list).Count == 0) || FiredRecently(bot, 2f))
@@ -826,13 +1204,17 @@ public class NadeSystemPlugin : BasePlugin
 					value.Add(mapNade.Id);
 					if (!_botFlashRatioWindow.TryGetValue(index, out (float, float) value2) || !(Server.CurrentTime < value2.Item1) || !(value2.Item2 < 1f) || !(Random.Shared.NextDouble() >= (double)value2.Item2))
 					{
+						bool hasPushingTeammate = HasTeammateNearby(bot, val, list, 900f);
 						(int blindable, int total) tuple = CountBlindableEnemies(bot, mapNade, list);
-						int item = tuple.blindable;
-						int item2 = tuple.total;
-						float flashRatioThreshold = GetFlashRatioThreshold(item, item2);
+						float flashRatioThreshold = GetFlashRatioThreshold(tuple.blindable, tuple.total);
+						// Proactive Entry Flash: If pushing with a teammate in the first 45s, allow entry flash without reading hidden enemy angles!
+						if (flashRatioThreshold <= 0f && hasPushingTeammate && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 45f)
+						{
+							flashRatioThreshold = 0.65f;
+						}
 						if (flashRatioThreshold > 0f)
 						{
-							_botFlashRatioWindow[index] = (Server.CurrentTime + 12f, flashRatioThreshold);
+							_botFlashRatioWindow[index] = (Server.CurrentTime + 10f, flashRatioThreshold);
 							TryConditionalReplay(bot, mapNade, list);
 							flag3 = true;
 						}
@@ -888,7 +1270,7 @@ public class NadeSystemPlugin : BasePlugin
 		{
 			return true;
 		}
-		return num * (x2 / num3) + num2 * (y / num3) >= 0.25f;
+		return num * (x2 / num3) + num2 * (y / num3) >= -0.5f;
 	}
 
 	private static CCSPlayerPawn? GetActiveLivePawn(CCSPlayerController p)
@@ -1039,9 +1421,23 @@ public class NadeSystemPlugin : BasePlugin
 			if (recordFootsteps)
 			{
 				Vector absVelocity = ((CBaseEntity)activeLivePawn).AbsVelocity;
-				if (absVelocity != null && absVelocity.X * absVelocity.X + absVelocity.Y * absVelocity.Y > 21000f)
+				if (absVelocity != null)
 				{
-					RecordSoundPoint(item, list);
+					float speedSq = absVelocity.X * absVelocity.X + absVelocity.Y * absVelocity.Y;
+					bool holdingSilentMove = false;
+					var moveSvc = activeLivePawn.MovementServices;
+					if (moveSvc?.Buttons != null)
+					{
+						var btnStates = moveSvc.Buttons.ButtonStates;
+						if (btnStates.Length > 0 && (btnStates[0] & ((1UL << 16) | (1UL << 2))) != 0)
+						{
+							holdingSilentMove = true;
+						}
+					}
+					if (!holdingSilentMove && speedSq > 21000f)
+					{
+						RecordSoundPoint(item, list);
+					}
 				}
 			}
 		}
@@ -1139,13 +1535,44 @@ public class NadeSystemPlugin : BasePlugin
 		return false;
 	}
 
-	private bool HasInformationOn(CCSPlayerController enemy, CCSPlayerController target)
+	private bool HasInformationOn(CCSPlayerController observer, CCSPlayerController target)
 	{
+		if (EnemySeesTarget(observer, target))
+		{
+			return true;
+		}
 		if (!PlayerMadeAudibleSound(target))
 		{
-			return EnemySeesTarget(enemy, target);
+			return false;
 		}
-		return true;
+		CCSPlayerPawn? obsPawn = GetActiveLivePawn(observer);
+		CCSPlayerPawn? tgtPawn = GetActiveLivePawn(target);
+		if (obsPawn?.AbsOrigin == null || tgtPawn?.AbsOrigin == null)
+		{
+			return false;
+		}
+		return Dist3D(obsPawn.AbsOrigin.X, obsPawn.AbsOrigin.Y, obsPawn.AbsOrigin.Z, tgtPawn.AbsOrigin.X, tgtPawn.AbsOrigin.Y, tgtPawn.AbsOrigin.Z) <= 1180f;
+	}
+
+	private bool TeamHasInformationOn(CCSPlayerController bot, CCSPlayerController enemy, List<CCSPlayerController> allControllers)
+	{
+		if (HasInformationOn(bot, enemy))
+		{
+			return true;
+		}
+		int botTeam = ((CBaseEntity)bot).TeamNum;
+		for (int i = 0; i < allControllers.Count; i++)
+		{
+			CCSPlayerController ally = allControllers[i];
+			if (((CEntityInstance)ally).IsValid && ally.PawnIsAlive && ((CBaseEntity)ally).TeamNum == botTeam && ally.Slot != bot.Slot)
+			{
+				if (HasInformationOn(ally, enemy))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	private bool FiredRecently(CCSPlayerController player, float seconds)
@@ -1226,55 +1653,246 @@ public class NadeSystemPlugin : BasePlugin
 				break;
 			}
 		}
-		CCSPlayerController_InGameMoneyServices inGameMoneyServices = bot.InGameMoneyServices;
-		if (inGameMoneyServices == null)
+		CCSPlayerPawn? pPawn = bot.PlayerPawn?.Value;
+		if (pPawn == null || !pPawn.IsValid || !HasGrenadeInInventory(pPawn, grenadeType, out string wName, out int itemDef))
 		{
 			return;
 		}
-		bool flag = ((CBaseEntity)bot).TeamNum == 3;
-		if ((flag ? CostCT : CostT).TryGetValue(grenadeType, out var value2) && inGameMoneyServices.Account >= value2)
+
+		uint index = ((CEntityInstance)bot).Index;
+		_replayBots.Add(index);
+		_pendingWindupLineups[g.Id] = Server.CurrentTime + 1.2f;
+		ExecuteRealisticThrow(bot, g, wName, itemDef);
+		((BasePlugin)this).AddTimer(1f, (Action)delegate
 		{
-			uint index = ((CEntityInstance)bot).Index;
-			bool isPoor = _poorBots.Contains(index);
-			int roundSpendCap = GetRoundSpendCap(flag, isPoor);
-			_roundSpendPerBot.TryGetValue(index, out var value3);
-			if (value3 < roundSpendCap)
-			{
-				inGameMoneyServices.Account -= value2;
-				Utilities.SetStateChanged((CBaseEntity)(object)bot, "CCSPlayerController", "m_pInGameMoneyServices", 0);
-				_roundSpendPerBot[index] = value3 + value2;
-			}
-			_replayBots.Add(index);
-			RegisterCooldown(g.Id, grenadeType);
-			IncrementCount(grenadeType, ((CBaseEntity)bot).TeamNum);
-			if (_botNadesMode == "less")
-			{
-				IncrementBotCount(grenadeType, index);
-			}
-			if ((_botNadesMode == "normal" || _botNadesMode == "less") && grenadeType == "smoke" && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 5f)
-			{
-				_earlySmokeCountByTeam.TryGetValue(((CBaseEntity)bot).TeamNum, out var value4);
-				_earlySmokeCountByTeam[((CBaseEntity)bot).TeamNum] = value4 + 1;
-			}
-			SpawnProjectile(bot, g);
-			((BasePlugin)this).AddTimer(1f, (Action)delegate
-			{
-				_replayBots.Remove(index);
-			}, (TimerFlags?)null);
+			_replayBots.Remove(index);
+		}, (TimerFlags?)null);
+	}
+
+	private void ExecuteRealisticThrow(CCSPlayerController bot, GrenadeData g, string weaponDesignerName, int itemDefIndex)
+	{
+		CCSPlayerPawn? pawn = bot.PlayerPawn?.Value;
+		if (pawn == null || !pawn.IsValid || !bot.PawnIsAlive) return;
+
+		int slot = bot.Slot;
+		var api = GetControllerApi();
+
+		// 1. Align view angles towards throw direction and register continuous 350ms wind-up brake
+		float vx = g.ProjectileVelocity.X;
+		float vy = g.ProjectileVelocity.Y;
+		float vz = g.ProjectileVelocity.Z;
+		float yaw = MathF.Atan2(vy, vx) * (180f / MathF.PI);
+		float hDist = MathF.Sqrt(vx * vx + vy * vy);
+		float pitch = (0f - MathF.Atan2(vz, hDist)) * (180f / MathF.PI);
+
+		if (pawn.AbsVelocity != null)
+		{
+			pawn.AbsVelocity.X *= 0.25f;
+			pawn.AbsVelocity.Y *= 0.25f;
 		}
+
+		if (api != null && slot >= 0)
+		{
+			api.SwitchBotWeapon(slot, itemDefIndex);
+			api.Lock(slot, LockTarget.Slot4);
+			api.Lock(slot, LockKind.Aim);
+		}
+
+		if (slot >= 0)
+		{
+			_activeWindups[slot] = new ActiveWindup(slot, yaw, pitch, Server.CurrentTime + 0.38f);
+		}
+
+		if (pawn.EyeAngles != null) { pawn.EyeAngles.Y = yaw; pawn.EyeAngles.X = pitch; }
+		if (pawn.V_angle != null) { pawn.V_angle.Y = yaw; pawn.V_angle.X = pitch; }
+		if (pawn.Bot != null)
+		{
+			pawn.Bot.ForwardSpeed = 0f;
+			pawn.Bot.LeftSpeed = 0f;
+			pawn.Bot.LookYaw = yaw;
+			pawn.Bot.LookPitch = pitch;
+		}
+
+		// 2. 350ms throw animation wind-up -> release from bot's exact eye/hand position
+		AddTimer(0.35f, () =>
+		{
+			try
+			{
+				_activeWindups.Remove(slot);
+				if (api != null && slot >= 0)
+				{
+					api.Unlock(slot, LockKind.Aim);
+				}
+
+				if (bot == null || !bot.IsValid || !bot.PawnIsAlive)
+				{
+					_pendingWindupLineups.Remove(g.Id);
+					if (api != null && slot >= 0) api.Unlock(slot, LockKind.Weapon);
+					return;
+				}
+
+				CCSPlayerPawn? livePawn = bot.PlayerPawn?.Value;
+				if (livePawn == null || !livePawn.IsValid || livePawn.AbsOrigin == null)
+				{
+					_pendingWindupLineups.Remove(g.Id);
+					if (api != null && slot >= 0) api.Unlock(slot, LockKind.Weapon);
+					return;
+				}
+
+				// If an enemy swung directly into sight during wind-up of a smoke, cancel throw and pull rifle back out!
+				if (g.GrenadeType == "smoke" && livePawn.Bot != null && livePawn.Bot.IsEnemyVisible)
+				{
+					_pendingWindupLineups.Remove(g.Id);
+					if (api != null && slot >= 0) api.Unlock(slot, LockKind.Weapon);
+					return;
+				}
+
+				Vector currentEyePos = new Vector(livePawn.AbsOrigin.X, livePawn.AbsOrigin.Y, livePawn.AbsOrigin.Z + (livePawn.ViewOffset?.Z ?? 64f));
+
+				// Re-verify wall clearance right in front of the bot's face at release moment!
+				if (!HasForwardClearance(currentEyePos, yaw, pitch, 34f))
+				{
+					_pendingWindupLineups.Remove(g.Id);
+					if (api != null && slot >= 0) api.Unlock(slot, LockKind.Weapon);
+					return;
+				}
+
+				Vector targetPos = new Vector(g.LandingPosition.X, g.LandingPosition.Y, g.LandingPosition.Z);
+				Vector actualOrigin;
+				Vector actualVelocity;
+
+				if (TrySolveBallisticArc(currentEyePos, targetPos, allowWallBounce: false, out Vector solvedOrigin, out Vector solvedVelocity))
+				{
+					actualOrigin = solvedOrigin;
+					actualVelocity = solvedVelocity;
+				}
+				else if (TrySolveBallisticArc(currentEyePos, targetPos, allowWallBounce: true, out Vector bounceOrigin, out Vector bounceVelocity))
+				{
+					actualOrigin = bounceOrigin;
+					actualVelocity = bounceVelocity;
+				}
+				else
+				{
+					// Recorded multi-bank / skybox wall-bounce lineup:
+					// Trace recorded initial bounce point B from g.ProjectilePosition along g.ProjectileVelocity,
+					// and aim from bot's real hands directly at B so wall-bounce lineups remain accurate!
+					float yawRad = yaw * (MathF.PI / 180f);
+					actualOrigin = new Vector(currentEyePos.X + MathF.Cos(yawRad) * 18f, currentEyePos.Y + MathF.Sin(yawRad) * 18f, currentEyePos.Z);
+					Vector origVel = new Vector(g.ProjectileVelocity.X, g.ProjectileVelocity.Y, g.ProjectileVelocity.Z);
+					float origSpeed = MathF.Sqrt(origVel.X * origVel.X + origVel.Y * origVel.Y + origVel.Z * origVel.Z);
+
+					bool aimedAtRecordedBounce = false;
+					actualVelocity = origVel;
+
+					try
+					{
+						CRayTraceInterface rt = _rayTraceCapability.Get();
+						if (rt != null && origSpeed > 100f)
+						{
+							_traceA ??= new Vector(0f, 0f, 0f);
+							_traceB ??= new Vector(0f, 0f, 0f);
+							_traceA.X = g.ProjectilePosition.X; _traceA.Y = g.ProjectilePosition.Y; _traceA.Z = g.ProjectilePosition.Z;
+							_traceB.X = g.ProjectilePosition.X + origVel.X * 0.65f;
+							_traceB.Y = g.ProjectilePosition.Y + origVel.Y * 0.65f;
+							_traceB.Z = g.ProjectilePosition.Z + origVel.Z * 0.65f - 180f * 0.65f * 0.65f;
+							RayTraceAPI.TraceOptions opt = new RayTraceAPI.TraceOptions((InteractionLayers)2109441, (InteractionLayers)0, false);
+							if (rt.TraceEndShape(_traceA, _traceB, null, opt, out RayTraceAPI.TraceResult bRes) && bRes.DidHit && bRes.Fraction > 0.12f && bRes.Fraction < 0.98f)
+							{
+								Vec3 bouncePt = new Vec3 { X = bRes.EndPosX, Y = bRes.EndPosY, Z = bRes.EndPosZ };
+								if (HasReleaseLoS(actualOrigin.X, actualOrigin.Y, actualOrigin.Z, bouncePt))
+								{
+									float tHit = Math.Max(0.12f, 0.65f * bRes.Fraction);
+									actualVelocity = new Vector(
+										(bouncePt.X - actualOrigin.X) / tHit,
+										(bouncePt.Y - actualOrigin.Y) / tHit,
+										(bouncePt.Z - actualOrigin.Z + 180f * tHit * tHit) / tHit);
+									aimedAtRecordedBounce = true;
+								}
+							}
+						}
+					}
+					catch { }
+
+					if (!aimedAtRecordedBounce)
+					{
+						float driftFromRecorded = Dist3D(currentEyePos.X, currentEyePos.Y, currentEyePos.Z, g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z);
+						bool initialArcClear = true;
+						try
+						{
+							CRayTraceInterface rt2 = _rayTraceCapability.Get();
+							if (rt2 != null && origSpeed > 100f)
+							{
+								initialArcClear = VerifyParabolicArcClear(rt2, actualOrigin, origVel.X, origVel.Y, origVel.Z, 0.70f, 4);
+							}
+						}
+						catch { }
+
+						if (driftFromRecorded > 145f || origSpeed <= 100f || !initialArcClear)
+						{
+							_pendingWindupLineups.Remove(g.Id);
+							// Too far from recorded lineup or blocked by nearby wall -> abort cleanly instead of missing badly!
+							if (api != null && slot >= 0) api.Unlock(slot, LockKind.Weapon);
+							return;
+						}
+					}
+				}
+
+				float finalYaw = MathF.Atan2(actualVelocity.Y, actualVelocity.X) * (180f / MathF.PI);
+				float finalHDist = MathF.Sqrt(actualVelocity.X * actualVelocity.X + actualVelocity.Y * actualVelocity.Y);
+				float finalPitch = (0f - MathF.Atan2(actualVelocity.Z, finalHDist)) * (180f / MathF.PI);
+				if (livePawn.EyeAngles != null) { livePawn.EyeAngles.Y = finalYaw; livePawn.EyeAngles.X = finalPitch; }
+				if (livePawn.V_angle != null) { livePawn.V_angle.Y = finalYaw; livePawn.V_angle.X = finalPitch; }
+				if (livePawn.Bot != null) { livePawn.Bot.LookYaw = finalYaw; livePawn.Bot.LookPitch = finalPitch; }
+
+				// Spawn projectile from real eye/hand release position
+				SpawnProjectileExplicit(bot, g.GrenadeType, actualOrigin, actualVelocity);
+				_pendingWindupLineups.Remove(g.Id);
+				RegisterCooldown(g.Id, g.GrenadeType);
+				IncrementCount(g.GrenadeType, ((CBaseEntity)bot).TeamNum);
+				if (_botNadesMode == "less")
+				{
+					IncrementBotCount(g.GrenadeType, ((CEntityInstance)bot).Index);
+				}
+				if ((_botNadesMode == "normal" || _botNadesMode == "less") && g.GrenadeType == "smoke" && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 25f)
+				{
+					_earlySmokeCountByTeam.TryGetValue(((CBaseEntity)bot).TeamNum, out var value4);
+					_earlySmokeCountByTeam[((CBaseEntity)bot).TeamNum] = value4 + 1;
+				}
+
+				// Remove / decrement physical item from inventory
+				if (!string.IsNullOrEmpty(weaponDesignerName))
+				{
+					ConsumeGrenade(bot, weaponDesignerName);
+				}
+
+				// After 120ms follow-through, release weapon lock so bot re-equips best gun
+				AddTimer(0.12f, () =>
+				{
+					if (api != null && slot >= 0)
+					{
+						api.Unlock(slot, LockKind.Weapon);
+					}
+				});
+			}
+			catch (Exception ex)
+			{
+				_pendingWindupLineups.Remove(g.Id);
+				ReleaseBotThrowLocks(slot, unlockWeapon: true);
+				Logger.LogError("[NadeSystem] Realistic throw error: {Msg}", ex.Message);
+			}
+		});
 	}
 
 	private void SpawnProjectile(CCSPlayerController bot, GrenadeData g)
 	{
-		//IL_0071: Unknown result type (might be due to invalid IL or missing references)
-		//IL_007b: Expected O, but got Unknown
-		//IL_00bb: Unknown result type (might be due to invalid IL or missing references)
-		//IL_00c5: Expected O, but got Unknown
-		//IL_0153: Unknown result type (might be due to invalid IL or missing references)
-		//IL_015d: Expected O, but got Unknown
-		string gtype = g.GrenadeType.ToLowerInvariant();
-		Vector origin = new Vector((float?)g.ProjectilePosition.X, (float?)g.ProjectilePosition.Y, (float?)g.ProjectilePosition.Z);
-		Vector velocity = new Vector((float?)g.ProjectileVelocity.X, (float?)g.ProjectileVelocity.Y, (float?)g.ProjectileVelocity.Z);
+		Vector origin = new Vector(g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z);
+		Vector velocity = new Vector(g.ProjectileVelocity.X, g.ProjectileVelocity.Y, g.ProjectileVelocity.Z);
+		SpawnProjectileExplicit(bot, g.GrenadeType, origin, velocity);
+	}
+
+	private void SpawnProjectileExplicit(CCSPlayerController bot, string gtype, Vector origin, Vector velocity)
+	{
+		gtype = gtype.ToLowerInvariant();
 		float value = MathF.Atan2(velocity.Y, velocity.X) * (180f / (float)Math.PI);
 		float x = MathF.Sqrt(velocity.X * velocity.X + velocity.Y * velocity.Y);
 		float value2 = (0f - MathF.Atan2(velocity.Z, x)) * (180f / (float)Math.PI);
@@ -1339,7 +1957,7 @@ public class NadeSystemPlugin : BasePlugin
 							((CBaseEntity)val3).Teleport(origin, angles, velocity);
 							((CBaseEntity)val3).DispatchSpawn();
 							((CBaseEntity)val3).Teleport(origin, angles, velocity);
-							StartDecoyFlashLoop(bot, g, val3, teamNum, angles);
+							StartDecoyFlashLoop(bot, val3, teamNum, angles);
 						}
 					}
 					else if (gtype == "smoke")
@@ -1434,7 +2052,7 @@ public class NadeSystemPlugin : BasePlugin
 		}
 	}
 
-	private void StartDecoyFlashLoop(CCSPlayerController bot, GrenadeData g, CFlashbangProjectile flash, int teamNum, QAngle angles)
+	private void StartDecoyFlashLoop(CCSPlayerController bot, CFlashbangProjectile flash, int teamNum, QAngle angles)
 	{
 		((BasePlugin)this).AddTimer(1f, (Action)delegate
 		{
@@ -1468,13 +2086,18 @@ public class NadeSystemPlugin : BasePlugin
 								((CBaseEntity)val4).Teleport(val2, angles, val3);
 								((CBaseEntity)val4).DispatchSpawn();
 								((CBaseEntity)val4).Teleport(val2, angles, val3);
-								StartDecoyFlashLoop(bot, g, val4, teamNum, angles);
+								StartDecoyFlashLoop(bot, val4, teamNum, angles);
 							}
 						}
 					}
 				}
 			}
 		}, (TimerFlags?)null);
+	}
+
+	private bool IsLineupPending(string id)
+	{
+		return _pendingWindupLineups.TryGetValue(id, out float expires) && expires > Server.CurrentTime;
 	}
 
 	private bool IsOnCooldown(string id)
@@ -1609,15 +2232,18 @@ public class NadeSystemPlugin : BasePlugin
 
 	private HookResult OnRoundStart(EventRoundStart @event, GameEventInfo info)
 	{
+		ResetServerMaxPlayersCache();
+		ReleaseAllThrowLocks();
 		_roundOver = false;
 		_freezeEndTime = 0f;
-		if (_mapNades == null || _mapNades.Count == 0 || !string.Equals(_loadedMapName, Server.MapName, StringComparison.OrdinalIgnoreCase))
+		if (_mapNades == null || _mapNades.Count == 0 || !_spawnsFromEntities || !string.Equals(_loadedMapName, Server.MapName, StringComparison.OrdinalIgnoreCase))
 		{
 			RefreshMapNades(Server.MapName);
 		}
 		_roundCountByTeam.Clear();
 		_roundCountByBot.Clear();
 		_cooldowns.Clear();
+		_pendingWindupLineups.Clear();
 		_replayBots.Clear();
 		_smokeCooldownBots.Clear();
 		_roundSpendPerBot.Clear();
@@ -1663,6 +2289,7 @@ public class NadeSystemPlugin : BasePlugin
 
 	private HookResult OnRoundEnd(EventRoundEnd @event, GameEventInfo info)
 	{
+		ReleaseAllThrowLocks();
 		_roundOver = true;
 		return (HookResult)0;
 	}
@@ -1718,16 +2345,8 @@ public class NadeSystemPlugin : BasePlugin
 
 	private HookResult OnPlayerBlind(EventPlayerBlind @event, GameEventInfo info)
 	{
-		CCSPlayerController userid = @event.Userid;
-		if ((CEntityInstance)(object)userid != (CEntityInstance)null && ((CEntityInstance)userid).IsValid && userid.IsBot && !userid.HasBeenControlledByPlayerThisRound)
-		{
-			CCSPlayerPawn val = userid.PlayerPawn?.Value;
-			if (_botFlashImmunityUntil.TryGetValue(((CEntityInstance)userid).Index, out var value) && Server.CurrentTime <= value && (CEntityInstance)(object)val != (CEntityInstance)null && ((CEntityInstance)val).IsValid)
-			{
-				((CCSPlayerPawnBase)val).FlashDuration *= 0.35f;
-				((CCSPlayerPawnBase)val).BlindUntilTime = Server.CurrentTime + ((CCSPlayerPawnBase)val).FlashDuration;
-			}
-		}
+		// Realism: Do NOT artificially reduce flashbang duration on bots!
+		// Bots should be blinded fairly like any human player when hit by a flashbang.
 		return (HookResult)0;
 	}
 
@@ -1757,8 +2376,52 @@ public class NadeSystemPlugin : BasePlugin
 		}
 	}
 
+	private static bool HasTeammateNearby(CCSPlayerController bot, CCSPlayerPawn? botPawn, List<CCSPlayerController> allControllers, float radius)
+	{
+		Vector? bPos = (botPawn != null) ? ((CBaseEntity)botPawn).AbsOrigin : null;
+		if (bPos == null) return false;
+		float rSq = radius * radius;
+		foreach (var p in allControllers)
+		{
+			if (!((CEntityInstance)p).IsValid || !p.PawnIsAlive || ((CBaseEntity)p).TeamNum != ((CBaseEntity)bot).TeamNum || ((CEntityInstance)p).Index == ((CEntityInstance)bot).Index)
+				continue;
+			CCSPlayerPawn? tmPawn = GetActiveLivePawn(p);
+			Vector? tPos = (tmPawn != null) ? ((CBaseEntity)tmPawn).AbsOrigin : null;
+			if (tPos == null) continue;
+			float dx = tPos.X - bPos.X;
+			float dy = tPos.Y - bPos.Y;
+			float dz = tPos.Z - bPos.Z;
+			if (dx * dx + dy * dy + dz * dz <= rSq)
+				return true;
+		}
+		return false;
+	}
+
+	private static bool HasTeammateNearSpot(CCSPlayerController bot, float lx, float ly, float lz, List<CCSPlayerController> allControllers, float safeRadius)
+	{
+		float rSq = safeRadius * safeRadius;
+		foreach (var p in allControllers)
+		{
+			if (!((CEntityInstance)p).IsValid || !p.PawnIsAlive || ((CBaseEntity)p).TeamNum != ((CBaseEntity)bot).TeamNum)
+				continue;
+			CCSPlayerPawn? tmPawn = GetActiveLivePawn(p);
+			Vector? tPos = (tmPawn != null) ? ((CBaseEntity)tmPawn).AbsOrigin : null;
+			if (tPos == null) continue;
+			float dx = tPos.X - lx;
+			float dy = tPos.Y - ly;
+			float dz = tPos.Z - lz;
+			if (dx * dx + dy * dy + dz * dz <= rSq)
+				return true;
+		}
+		return false;
+	}
+
 	private bool PassesSituationalCheck(CCSPlayerController bot, CCSPlayerPawn pawn, GrenadeData g, string gtype, List<CCSPlayerController> allControllers)
 	{
+		if (!HasLiveEnemyForTeam(((CBaseEntity)bot).TeamNum, allControllers))
+		{
+			return false;
+		}
 		if (gtype == "he" || gtype == "molotov")
 		{
 			if (FiredRecently(bot, 1f))
@@ -1768,7 +2431,15 @@ public class NadeSystemPlugin : BasePlugin
 			float lx = g.LandingPosition.X;
 			float ly = g.LandingPosition.Y;
 			float lz = g.LandingPosition.Z;
-			List<CCSPlayerController> list = allControllers.Where(delegate(CCSPlayerController p)
+			if (HasTeammateNearSpot(bot, lx, ly, lz, allControllers, 280f))
+			{
+				return false;
+			}
+			if (gtype == "molotov" && !IsNoActiveSmokeNear(lx, ly, lz, 200f))
+			{
+				return false;
+			}
+			List<CCSPlayerController> knownEnemiesAtSpot = allControllers.Where(delegate(CCSPlayerController p)
 			{
 				if (!((CEntityInstance)p).IsValid || ((CBaseEntity)p).TeamNum == ((CBaseEntity)bot).TeamNum)
 				{
@@ -1783,25 +2454,22 @@ public class NadeSystemPlugin : BasePlugin
 				float num3 = val2.X - lx;
 				float num4 = val2.Y - ly;
 				float num5 = val2.Z - lz;
-				return num3 * num3 + num4 * num4 + num5 * num5 <= 48400f;
+				return num3 * num3 + num4 * num4 + num5 * num5 <= 48400f && TeamHasInformationOn(bot, p, allControllers);
 			}).ToList();
-			if (list.Count == 0)
+
+			if (knownEnemiesAtSpot.Count > 0)
 			{
-				return false;
+				return true;
 			}
-			if ((_botNadesMode == "normal" || _botNadesMode == "more" || _botNadesMode == "less") && !list.Any((CCSPlayerController e) => HasInformationOn(e, bot)))
+
+			// Proactive Map Molotov (Zero Radar-Hack!):
+			// When pushing with a teammate (<= 900u) during the first 45s of the round, allow clearing default corners
+			// (e.g. Under Palace, Sandwich, Car) based strictly on team presence, WITHOUT reading hidden enemy coordinates!
+			if (gtype == "molotov" && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 45f && HasTeammateNearby(bot, pawn, allControllers, 900f))
 			{
-				float num = ((!(_botNadesMode == "more")) ? ((gtype == "he") ? 0.28f : 0.65f) : ((gtype == "he") ? 0.55f : 0.8f));
-				if (Random.Shared.NextDouble() >= (double)num)
-				{
-					RegisterProbFailCooldown(g.Id);
-					return false;
-				}
+				return true;
 			}
-			if (gtype == "molotov" && !IsNoActiveSmokeNear(lx, ly, lz, 200f))
-			{
-				return false;
-			}
+			return false;
 		}
 		if (gtype == "flash")
 		{
@@ -1810,19 +2478,19 @@ public class NadeSystemPlugin : BasePlugin
 				return false;
 			}
 			List<CCSPlayerController> list2 = CanBlindAnyEnemy(bot, g, allControllers);
-			if (list2.Count == 0)
+			if (list2.Count > 0 && list2.Any((CCSPlayerController e) => TeamHasInformationOn(bot, e, allControllers)))
 			{
-				return false;
+				return true;
 			}
-			if ((_botNadesMode == "normal" || _botNadesMode == "more" || _botNadesMode == "less") && !list2.Any((CCSPlayerController e) => HasInformationOn(e, bot)))
+			// Proactive Entry Flash (Zero Radar-Hack!):
+			// When executing/pushing with a teammate (<= 900u) during the first 45s, throw the recorded entry flash!
+			if (_freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 45f &&
+			    HasTeammateNearby(bot, pawn, allControllers, 900f) &&
+			    !HasTeammateNearSpot(bot, g.LandingPosition.X, g.LandingPosition.Y, g.LandingPosition.Z, allControllers, 320f))
 			{
-				float num2 = ((_botNadesMode == "more") ? 1f : 0.8f);
-				if (Random.Shared.NextDouble() >= (double)num2)
-				{
-					RegisterProbFailCooldown(g.Id);
-					return false;
-				}
+				return true;
 			}
+			return false;
 		}
 		if (gtype == "smoke")
 		{
@@ -1837,40 +2505,14 @@ public class NadeSystemPlugin : BasePlugin
 			{
 				return false;
 			}
-			if ((_botNadesMode == "normal" || _botNadesMode == "less") && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 5f)
+			if ((_botNadesMode == "normal" || _botNadesMode == "less") && _freezeEndTime > 0f && Server.CurrentTime - _freezeEndTime < 15f)
 			{
 				_earlySmokeCountByTeam.TryGetValue(((CBaseEntity)bot).TeamNum, out var value);
-				if (value >= 1)
+				int maxEarlySmokes = (((CBaseEntity)bot).TeamNum == 2) ? 3 : 2;
+				if (value >= maxEarlySmokes)
 				{
 					return false;
 				}
-			}
-			if (!allControllers.Any(delegate(CCSPlayerController p)
-			{
-				if (!((CEntityInstance)p).IsValid || ((CBaseEntity)p).TeamNum == ((CBaseEntity)bot).TeamNum)
-				{
-					return false;
-				}
-				CCSPlayerPawn? activeLivePawn = GetActiveLivePawn(p);
-				Vector val2 = ((activeLivePawn != null) ? ((CBaseEntity)activeLivePawn).AbsOrigin : null);
-				return val2 != null && Dist3D(lx2, ly2, lz2, val2.X, val2.Y, val2.Z) <= 2250f;
-			}))
-			{
-				return false;
-			}
-			CPlantedC4 val = Utilities.FindAllEntitiesByDesignerName<CPlantedC4>("planted_c4").FirstOrDefault();
-			if ((CEntityInstance)(object)val != (CEntityInstance)null && ((CEntityInstance)val).IsValid && !allControllers.Any(delegate(CCSPlayerController p)
-			{
-				if (!((CEntityInstance)p).IsValid || ((CBaseEntity)p).TeamNum == ((CBaseEntity)bot).TeamNum)
-				{
-					return false;
-				}
-				CCSPlayerPawn? activeLivePawn = GetActiveLivePawn(p);
-				Vector val2 = ((activeLivePawn != null) ? ((CBaseEntity)activeLivePawn).AbsOrigin : null);
-				return val2 != null && Dist3D(lx2, ly2, lz2, val2.X, val2.Y, val2.Z) <= 1150f;
-			}))
-			{
-				return false;
 			}
 		}
 		return true;
@@ -1890,23 +2532,7 @@ public class NadeSystemPlugin : BasePlugin
 		{
 			return false;
 		}
-		if (Server.CurrentTime - _freezeEndTime > 22f)
-		{
-			float lx = g.LandingPosition.X;
-			float ly = g.LandingPosition.Y;
-			float lz = g.LandingPosition.Z;
-			return allControllers.Any(delegate(CCSPlayerController p)
-			{
-				if (!((CEntityInstance)p).IsValid || !p.PawnIsAlive || ((CBaseEntity)p).TeamNum == ((CBaseEntity)bot).TeamNum)
-				{
-					return false;
-				}
-				CCSPlayerPawn? activeLivePawn = GetActiveLivePawn(p);
-				Vector val = ((activeLivePawn != null) ? ((CBaseEntity)activeLivePawn).AbsOrigin : null);
-				return val != null && Dist3D(lx, ly, lz, val.X, val.Y, val.Z) <= 1750f;
-			});
-		}
-		return true;
+		return HasLiveEnemyForTeam(((CBaseEntity)bot).TeamNum, allControllers);
 	}
 
 	private List<CCSPlayerController> CanBlindAnyEnemy(CCSPlayerController bot, GrenadeData g, List<CCSPlayerController> allControllers)
@@ -2016,6 +2642,8 @@ public class NadeSystemPlugin : BasePlugin
 			{
 				return true;
 			}
+			_traceA ??= new Vector(0f, 0f, 0f);
+			_traceB ??= new Vector(0f, 0f, 0f);
 			_traceA.X = landing.X;
 			_traceA.Y = landing.Y;
 			_traceA.Z = landing.Z;
@@ -2078,97 +2706,61 @@ public class NadeSystemPlugin : BasePlugin
 		return 0f;
 	}
 
-	private void TrySpawnInstantGrenade(CCSPlayerController bot, Vector spawnPos, string gtype, Vector? velocity = null)
+	private void TrySpawnInstantGrenade(CCSPlayerController bot, Vector spawnPos, string gtype, Vector? velocity = null, bool switchHandBriefly = false)
 	{
-		//IL_0137: Unknown result type (might be due to invalid IL or missing references)
 		if (_botNadesMode == "off" || bot.HasBeenControlledByPlayerThisRound || !Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller").Any((CCSPlayerController p) => ((CEntityInstance)p).IsValid && p.PawnIsAlive && (((CBaseEntity)p).TeamNum == 2 || ((CBaseEntity)p).TeamNum == 3) && ((CBaseEntity)p).TeamNum != ((CBaseEntity)bot).TeamNum))
 		{
 			return;
 		}
-		CCSPlayerController_InGameMoneyServices inGameMoneyServices = bot.InGameMoneyServices;
-		if (inGameMoneyServices == null)
+		CCSPlayerPawn? val = bot.PlayerPawn?.Value;
+		if (val == null || !val.IsValid || !bot.PawnIsAlive || val.AbsOrigin == null)
 		{
 			return;
 		}
-		bool flag = ((CBaseEntity)bot).TeamNum == 3;
-		if (!(flag ? CostCT : CostT).TryGetValue(gtype, out var value) || inGameMoneyServices.Account < value)
+
+		if (!HasGrenadeInInventory(val, gtype, out string wName, out int itemDef))
 		{
 			return;
 		}
-		uint index = ((CEntityInstance)bot).Index;
-		bool isPoor = _poorBots.Contains(index);
-		int roundSpendCap = GetRoundSpendCap(flag, isPoor);
-		_roundSpendPerBot.TryGetValue(index, out var value2);
-		if (value2 < roundSpendCap)
+
+		float yawRad = ((val.EyeAngles?.Y ?? 0f) * (MathF.PI / 180f));
+		float fx = MathF.Cos(yawRad);
+		float fy = MathF.Sin(yawRad);
+		Vector handOrigin = new Vector(val.AbsOrigin.X + fx * 14f, val.AbsOrigin.Y + fy * 14f, val.AbsOrigin.Z + 44f);
+		Vector underhandVel = velocity ?? new Vector(fx * 45f, fy * 45f, -135f);
+
+		if (switchHandBriefly && !val.IsDefusing && bot.Slot >= 0)
 		{
-			inGameMoneyServices.Account -= value;
-			Utilities.SetStateChanged((CBaseEntity)(object)bot, "CCSPlayerController", "m_pInGameMoneyServices", 0);
-			_roundSpendPerBot[index] = value2 + value;
-		}
-		Vector vel = (Vector)(((object)velocity) ?? ((object)new Vector((float?)0f, (float?)0f, (float?)0f)));
-		Server.NextFrame((Action)delegate
-		{
-			//IL_0228: Unknown result type (might be due to invalid IL or missing references)
-			//IL_022f: Expected O, but got Unknown
-			try
+			int slot = bot.Slot;
+			var api = GetControllerApi();
+			if (api != null)
 			{
-				CCSPlayerPawn val = bot.PlayerPawn?.Value;
-				if (!((CEntityInstance)(object)val == (CEntityInstance)null) && ((CEntityInstance)val).IsValid)
+				api.SwitchBotWeapon(slot, itemDef);
+				api.Lock(slot, LockTarget.Slot4);
+				AddTimer(0.18f, () =>
 				{
-					int teamNum = ((CBaseEntity)bot).TeamNum;
-					if (gtype == "smoke")
+					try
 					{
-						Vector zeroAng = new Vector(0f, 0f, 0f); QAngle downAng = new QAngle(0f, 0f, 0f); CSmokeGrenadeProjectile val2 = (((NativeObject)_smokeCreate).Handle != IntPtr.Zero) ? _smokeCreate.Invoke((nint)((NativeObject)spawnPos).Handle, (nint)((NativeObject)downAng).Handle, (nint)((NativeObject)vel).Handle, (nint)((NativeObject)zeroAng).Handle, (nint)((NativeEntity)val).Handle, 45, teamNum) : null;
-						if ((CEntityInstance)(object)val2 != (CEntityInstance)null && ((CEntityInstance)val2).IsValid)
+						api.Unlock(slot, LockKind.Weapon);
+						if (bot.IsValid && bot.PawnIsAlive)
 						{
-							((CBaseEntity)val2).TeamNum = (byte)teamNum;
-							((CBaseGrenade)val2).Thrower.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-							((CBaseGrenade)val2).OriginalThrower.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-							((CBaseEntity)val2).OwnerEntity.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-						}
-						else
-						{
-							CSmokeGrenadeProjectile fallbackSmoke = Utilities.CreateEntityByName<CSmokeGrenadeProjectile>("smokegrenade_projectile");
-							if (fallbackSmoke != null && fallbackSmoke.IsValid)
+							CCSPlayerPawn? lp = bot.PlayerPawn?.Value;
+							if (lp != null && lp.IsValid && lp.AbsOrigin != null && HasGrenadeInInventory(lp, gtype, out string lwName, out _))
 							{
-								fallbackSmoke.TeamNum = (byte)teamNum;
-								fallbackSmoke.Thrower.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-								fallbackSmoke.OriginalThrower.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-								fallbackSmoke.OwnerEntity.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-								fallbackSmoke.Teleport(spawnPos, downAng, vel);
-								fallbackSmoke.DispatchSpawn();
+								Vector dropPos = new Vector(lp.AbsOrigin.X + fx * 14f, lp.AbsOrigin.Y + fy * 14f, lp.AbsOrigin.Z + 44f);
+								ConsumeGrenade(bot, lwName);
+								SpawnProjectileExplicit(bot, gtype, dropPos, underhandVel);
 							}
 						}
 					}
-					else if (gtype == "flash")
-					{
-						CFlashbangProjectile val3 = Utilities.CreateEntityByName<CFlashbangProjectile>("flashbang_projectile");
-						if ((CEntityInstance)(object)val3 != (CEntityInstance)null)
-						{
-							((CBaseEntity)val3).TeamNum = (byte)teamNum;
-							((CBaseGrenade)val3).Thrower.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-							((CBaseGrenade)val3).OriginalThrower.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-							((CBaseEntity)val3).OwnerEntity.Raw = ((CHandle<CEntityInstance>)(object)((NativeEntity)val).EntityHandle).Raw;
-							((CBaseCSGrenadeProjectile)val3).InitialPosition.X = spawnPos.X;
-							((CBaseCSGrenadeProjectile)val3).InitialPosition.Y = spawnPos.Y;
-							((CBaseCSGrenadeProjectile)val3).InitialPosition.Z = spawnPos.Z;
-							((CBaseCSGrenadeProjectile)val3).InitialVelocity.X = vel.X;
-							((CBaseCSGrenadeProjectile)val3).InitialVelocity.Y = vel.Y;
-							((CBaseCSGrenadeProjectile)val3).InitialVelocity.Z = vel.Z;
-							((CBaseEntity)val3).Elasticity = 0.33f;
-							QAngle val4 = new QAngle((float?)(-90f), (float?)0f, (float?)0f);
-							((CBaseEntity)val3).Teleport(spawnPos, val4, vel);
-							((CBaseEntity)val3).DispatchSpawn();
-							((CBaseEntity)val3).Teleport(spawnPos, val4, vel);
-						}
-					}
-				}
+					catch { api.Unlock(slot, LockKind.Weapon); }
+				});
+				return;
 			}
-			catch (Exception ex)
-			{
-				Server.PrintToConsole("[NadeSystem] TrySpawnInstantGrenade error: " + ex.Message);
-			}
-		});
+		}
+
+		ConsumeGrenade(bot, wName);
+		SpawnProjectileExplicit(bot, gtype, handOrigin, underhandVel);
 	}
 
 	private HookResult OnBombBeginDefuse(EventBombBegindefuse @event, GameEventInfo info)
@@ -2276,7 +2868,7 @@ public class NadeSystemPlugin : BasePlugin
 			_molotovEscapeSmokeCooldown[teamNum] = currentTime + 18f;
 			if (((CBaseEntity)val).AbsOrigin != null)
 			{
-				TrySpawnInstantGrenade(userid, new Vector((float?)((CBaseEntity)val).AbsOrigin.X, (float?)((CBaseEntity)val).AbsOrigin.Y, (float?)(((CBaseEntity)val).AbsOrigin.Z + 5f)), "smoke");
+				TrySpawnInstantGrenade(userid, new Vector((float?)((CBaseEntity)val).AbsOrigin.X, (float?)((CBaseEntity)val).AbsOrigin.Y, (float?)(((CBaseEntity)val).AbsOrigin.Z + 44f)), "smoke", switchHandBriefly: true);
 			}
 		}
 	}
@@ -2307,6 +2899,15 @@ public class NadeSystemPlugin : BasePlugin
 		{
 			return;
 		}
+
+		string retalWeapon = "";
+		int retalItemDef = 0;
+		if (!HasGrenadeInInventory(victimPawn, "he", out retalWeapon, out retalItemDef) &&
+		    !HasGrenadeInInventory(victimPawn, "molotov", out retalWeapon, out retalItemDef))
+		{
+			return;
+		}
+
 		CCSPlayerPawn? activeLivePawn = GetActiveLivePawn(attacker);
 		Vector atkPos = ((activeLivePawn != null) ? ((CBaseEntity)activeLivePawn).AbsOrigin : null);
 		if (atkPos == null)
@@ -2318,6 +2919,7 @@ public class NadeSystemPlugin : BasePlugin
 		{
 			return;
 		}
+
 		Vector vPos = ((CBaseEntity)victimPawn).AbsOrigin;
 		List<GrenadeData> list = (from g in _mapNades.Where(delegate(GrenadeData g)
 			{
@@ -2325,42 +2927,56 @@ public class NadeSystemPlugin : BasePlugin
 				{
 					return false;
 				}
-				return !(Dist3D(atkPos.X, atkPos.Y, atkPos.Z, g.LandingPosition.X, g.LandingPosition.Y, g.LandingPosition.Z) > 220f) && !IsOnCooldown(g.Id);
+				if (Dist3D(vPos.X, vPos.Y, vPos.Z, g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z) > 80f)
+				{
+					return false;
+				}
+				return !(Dist3D(atkPos.X, atkPos.Y, atkPos.Z, g.LandingPosition.X, g.LandingPosition.Y, g.LandingPosition.Z) > 260f) && !IsOnCooldown(g.Id);
 			})
 			orderby FacesThrowDirection(victimPawn, g) ? 1 : 0 descending, Dist3D(vPos.X, vPos.Y, vPos.Z, g.ProjectilePosition.X, g.ProjectilePosition.Y, g.ProjectilePosition.Z)
 			select g).ToList();
-		CCSPlayerController_InGameMoneyServices inGameMoneyServices = userid.InGameMoneyServices;
-		if (inGameMoneyServices == null)
-		{
-			return;
-		}
-		bool flag = ((CBaseEntity)userid).TeamNum == 3;
-		Dictionary<string, int> dictionary = (flag ? CostCT : CostT);
+
 		uint index = ((CEntityInstance)userid).Index;
-		int roundSpendCap = GetRoundSpendCap(flag, _poorBots.Contains(index));
-		if (list.Count <= 0)
+		if (list.Count > 0)
 		{
-			return;
+			GrenadeData grenadeData = list[0];
+			string grenadeType = grenadeData.GrenadeType;
+			if (HasGrenadeInInventory(victimPawn, grenadeType, out retalWeapon, out retalItemDef))
+			{
+				RegisterCooldown(grenadeData.Id, grenadeType);
+				ExecuteRealisticThrow(userid, grenadeData, retalWeapon, retalItemDef);
+				IncrementCount(grenadeType, ((CBaseEntity)userid).TeamNum);
+				if (_botNadesMode == "less")
+				{
+					IncrementBotCount(grenadeType, index);
+				}
+				_retaliationCooldown[teamNum] = Server.CurrentTime + 7f;
+			}
 		}
-		GrenadeData grenadeData = list[0];
-		string grenadeType = grenadeData.GrenadeType;
-		if (dictionary.TryGetValue(grenadeType, out var value2) && inGameMoneyServices.Account >= value2 && (_botNadesMode != "less" || LessModeAllows(grenadeType, index)))
+		else
 		{
-			_roundSpendPerBot.TryGetValue(index, out var value3);
-			if (value3 < roundSpendCap)
+			Vector eyePos = new Vector(vPos.X, vPos.Y, vPos.Z + 64f);
+			if (TrySolveBallisticArc(eyePos, atkPos, allowWallBounce: true, out Vector launchOrigin, out Vector launchVelocity))
 			{
-				inGameMoneyServices.Account -= value2;
-				Utilities.SetStateChanged((CBaseEntity)(object)userid, "CCSPlayerController", "m_pInGameMoneyServices", 0);
-				_roundSpendPerBot[index] = value3 + value2;
+				string gType = retalWeapon.Contains("molotov") || retalWeapon.Contains("incgrenade") ? "molotov" : "he";
+				GrenadeData dynRetal = new GrenadeData
+				{
+					Id = $"retal_{index}_{(int)Server.CurrentTime}",
+					MapName = Server.MapName,
+					GrenadeType = gType,
+					ProjectilePosition = new Vec3 { X = launchOrigin.X, Y = launchOrigin.Y, Z = launchOrigin.Z },
+					ProjectileVelocity = new Vec3 { X = launchVelocity.X, Y = launchVelocity.Y, Z = launchVelocity.Z },
+					LandingPosition = new Vec3 { X = atkPos.X, Y = atkPos.Y, Z = atkPos.Z },
+					Description = "RetaliationArc"
+				};
+				ExecuteRealisticThrow(userid, dynRetal, retalWeapon, retalItemDef);
+				IncrementCount(gType, ((CBaseEntity)userid).TeamNum);
+				if (_botNadesMode == "less")
+				{
+					IncrementBotCount(gType, index);
+				}
+				_retaliationCooldown[teamNum] = Server.CurrentTime + 7f;
 			}
-			RegisterCooldown(grenadeData.Id, grenadeType);
-			SpawnProjectile(userid, grenadeData);
-			IncrementCount(grenadeType, ((CBaseEntity)userid).TeamNum);
-			if (_botNadesMode == "less")
-			{
-				IncrementBotCount(grenadeType, index);
-			}
-			_retaliationCooldown[teamNum] = Server.CurrentTime + 7f;
 		}
 	}
 
@@ -2369,13 +2985,14 @@ public class NadeSystemPlugin : BasePlugin
 		try
 		{
 			string mapName = Server.MapName;
-			if (!string.IsNullOrEmpty(mapName))
+			if (!string.IsNullOrEmpty(mapName) && !string.Equals(mapName, "<empty>", StringComparison.OrdinalIgnoreCase))
 			{
 				if (!string.Equals(_loadedMapName, mapName, StringComparison.OrdinalIgnoreCase))
 				{
 					RefreshMapNades(mapName);
 				}
 				_tick++;
+				ProcessActiveWindups();
 				UpdateSoundTrails(_tick % 4 == 0);
 				if (_tick % 4 == 0)
 				{

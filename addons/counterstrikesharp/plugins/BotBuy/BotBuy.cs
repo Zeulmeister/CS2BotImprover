@@ -7,9 +7,11 @@ using System.Runtime.CompilerServices;
 using System.Runtime.Versioning;
 using System.Security;
 using System.Security.Permissions;
+using BotControllerApi;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
+using CounterStrikeSharp.API.Core.Capabilities;
 using CounterStrikeSharp.API.Modules.Cvars;
 using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
@@ -31,23 +33,130 @@ public sealed class BotBuyPatch : BasePlugin
 
 	private readonly Dictionary<int, int> _prevArmor = new Dictionary<int, int>();
 
+	private float _roundStartTime = 0f;
+
+	private static readonly PluginCapability<IBotControllerApi> _controllerCap =
+		new PluginCapability<IBotControllerApi>("botcontroller:api");
+
+	private static IBotControllerApi? TryGetControllerApi()
+	{
+		try { return _controllerCap.Get(); }
+		catch { return null; }
+	}
+
+	private static readonly FieldInfo? _serverMaxPlayersField =
+		typeof(Server).GetField("_maxPlayers", BindingFlags.NonPublic | BindingFlags.Static);
+
+	private static void ResetServerMaxPlayersCache()
+	{
+		try
+		{
+			_serverMaxPlayersField?.SetValue(null, null);
+		}
+		catch
+		{
+		}
+	}
+
 	private static readonly HashSet<string> PrimaryWeapons = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
 	{
 		"weapon_ak47", "weapon_m4a1_silencer", "weapon_m4a1", "weapon_galilar", "weapon_famas", "weapon_awp", "weapon_ssg08", "weapon_mac10", "weapon_mp9", "weapon_ump45",
 		"weapon_mp7", "weapon_mp5sd", "weapon_aug", "weapon_sg556"
 	};
 
+	private static readonly HashSet<string> Tier1Primaries = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+	{
+		"weapon_ak47", "weapon_m4a1_silencer", "weapon_m4a1", "weapon_aug", "weapon_sg556", "weapon_awp"
+	};
+
+	private static readonly HashSet<string> LowTierPrimaries = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+	{
+		"weapon_galilar", "weapon_famas", "weapon_ssg08", "weapon_mac10", "weapon_mp9", "weapon_ump45",
+		"weapon_mp7", "weapon_mp5sd", "weapon_bizon", "weapon_p90", "weapon_nova", "weapon_xm1014", "weapon_mag7", "weapon_sawedoff"
+	};
+
 	public override string ModuleName => "BotBuyPatch";
 
-	public override string ModuleVersion => "1.2.0";
+	public override string ModuleVersion => "1.5.0";
 
-	public override string ModuleAuthor => "ed0ard (Fixed & Optimized)";
+	public override string ModuleAuthor => "ed0ard & Antigravity (SS+ Pro Realism Economy)";
 
-	public override string ModuleDescription => "Enable bots to take intelligent buy and drop options";
+	public override string ModuleDescription => "Competitive MR12 Team Economy, Physical Grenade Buying, Native Buy Guard & Tier-1 Rifle Upgrade";
 
 	public override void Load(bool hotReload)
 	{
-		Logger.LogInformation("[BotBuy] v1.3.0 Loaded! Competitive MR12 Team Economy active.");
+		ResetServerMaxPlayersCache();
+		RegisterEventHandler<EventPlayerSpawn>(OnPlayerSpawn);
+		Logger.LogInformation("[BotBuy] v1.5.0 Loaded! Competitive MR12 Team Economy, Physical Utility Equipping & Tier-1 Rifle Upgrade active.");
+	}
+
+	private HookResult OnPlayerSpawn(EventPlayerSpawn @event, GameEventInfo info)
+	{
+		CCSPlayerController? bot = @event.Userid;
+		if (bot == null || !bot.IsValid || !bot.IsBot)
+		{
+			return HookResult.Continue;
+		}
+		// At round start, ProcessTeamPurchases manages the collective economy.
+		// OnPlayerSpawn only provides fallback purchasing if a player spawns late (e.g. after freeze time in casual/deathmatch).
+		if (Server.CurrentTime - _roundStartTime < 6.0f)
+		{
+			return HookResult.Continue;
+		}
+		AddTimer(0.25f, () =>
+		{
+			try
+			{
+				if (bot == null || !bot.IsValid || !bot.IsBot || !bot.PawnIsAlive || bot.InGameMoneyServices == null)
+					return;
+				ConVar? loadoutCvar = ConVar.Find("bot_loadout");
+				if (loadoutCvar != null && !string.IsNullOrEmpty(loadoutCvar.StringValue))
+					return;
+
+				bool isCT = (int)bot.Team == 3;
+				bool hasArmor = (bot.PlayerPawn.Value?.ArmorValue ?? 0) >= 50;
+				int fullBuyThreshold = isCT ? (hasArmor ? 2900 : 3550) : (hasArmor ? 2700 : 3350);
+				int money = bot.InGameMoneyServices.Account;
+
+				int teamAwpCount = Utilities.FindAllEntitiesByDesignerName<CCSPlayerController>("cs_player_controller").Count(p => p.IsValid && p.Team == bot.Team && Inventory(p).Weapons.Contains("weapon_awp"));
+
+				if (money >= fullBuyThreshold && !HasTier1Primary(bot))
+				{
+					RefundOrStripLowTierPrimaries(bot);
+					Buy(bot, "item_assaultsuit");
+					Buy(bot, "item_kevlar");
+
+					float roll = Random.Shared.NextSingle();
+					if (isCT)
+					{
+						if (roll < 0.14f && teamAwpCount == 0 && bot.InGameMoneyServices.Account >= 4750)
+							Buy(bot, "weapon_awp");
+						else if (roll < 0.65f)
+							_ = Buy(bot, "weapon_m4a1_silencer") || Buy(bot, "weapon_m4a1") || Buy(bot, "weapon_famas");
+						else
+							_ = Buy(bot, "weapon_m4a1") || Buy(bot, "weapon_m4a1_silencer") || Buy(bot, "weapon_famas");
+
+						if (bot.InGameMoneyServices.Account >= 400)
+							BuyDefuserIfNeeded(bot);
+					}
+					else
+					{
+						if (roll < 0.14f && teamAwpCount == 0 && bot.InGameMoneyServices.Account >= 4750)
+							Buy(bot, "weapon_awp");
+						else
+							_ = Buy(bot, "weapon_ak47") || Buy(bot, "weapon_galilar");
+					}
+
+					BuyTacticalGrenades(bot, isCT, isFullBuy: true);
+				}
+				else if (HasTier1Primary(bot) && money >= 400)
+				{
+					BuyTacticalGrenades(bot, isCT, isFullBuy: money >= 1200);
+				}
+			}
+			catch { }
+		});
+		return HookResult.Continue;
 	}
 
 	[GameEventHandler(/*Could not decode attribute arguments.*/)]
@@ -102,10 +211,20 @@ public sealed class BotBuyPatch : BasePlugin
 		//IL_01a4: Unknown result type (might be due to invalid IL or missing references)
 		try
 		{
+			ResetServerMaxPlayersCache();
+			_roundStartTime = Server.CurrentTime;
 			if (Server.MapName == "aim_rush")
 			{
 				return (HookResult)0;
 			}
+			ConVar ecoLimitCvar = ConVar.Find("bot_eco_limit");
+			ConVar loadoutCvar = ConVar.Find("bot_loadout");
+			bool hasCustomLoadout = (loadoutCvar != null && !string.IsNullOrEmpty(loadoutCvar.StringValue));
+			if (ecoLimitCvar != null && !hasCustomLoadout)
+			{
+				ecoLimitCvar.SetValue<float>(99999f);
+			}
+			IBotControllerApi? botCtrlApi = !hasCustomLoadout ? TryGetControllerApi() : null;
 			List<CCSPlayerController> allPlayers = new List<CCSPlayerController>();
 			List<CCSPlayerController> allCT = new List<CCSPlayerController>();
 			List<CCSPlayerController> list = new List<CCSPlayerController>();
@@ -116,6 +235,10 @@ public sealed class BotBuyPatch : BasePlugin
 				if ((CEntityInstance)(object)item2 == (CEntityInstance)null || !((CEntityInstance)item2).IsValid)
 				{
 					continue;
+				}
+				if (item2.IsBot && botCtrlApi != null && item2.Slot >= 0)
+				{
+					botCtrlApi.SetBuySkip(item2.Slot);
 				}
 				allPlayers.Add(item2);
 				if ((int)item2.Team == 3)
@@ -191,7 +314,7 @@ public sealed class BotBuyPatch : BasePlugin
 					}
 				}, (TimerFlags?)null);
 			}
-			((BasePlugin)this).AddTimer(0.4f, (Action)delegate
+			((BasePlugin)this).AddTimer(0.15f, (Action)delegate
 			{
 				foreach (CCSPlayerController item7 in allPlayers)
 				{
@@ -208,9 +331,6 @@ public sealed class BotBuyPatch : BasePlugin
 						Refund(item7, "weapon_revolver");
 					}
 				}
-			}, (TimerFlags?)null);
-			((BasePlugin)this).AddTimer(0.6f, (Action)delegate
-			{
 				if (IsFirstRoundOfHalf())
 				{
 					return;
@@ -285,51 +405,61 @@ public sealed class BotBuyPatch : BasePlugin
 						case 800:
 							if ((int)item11.Team == 3)
 							{
-								if (num2 < 0.75f)
+								if (num2 < 0.55f)
 								{
 									Buy(item11, "item_kevlar");
 								}
-								else if (num2 < 0.81f)
+								else if (num2 < 0.70f)
 								{
-									Swap(item11, "weapon_usp_silencer", "weapon_elite");
-									Swap(item11, "weapon_hkp2000", "weapon_elite");
+									BuyDefuserIfNeeded(item11);
+									Buy(item11, "weapon_smokegrenade");
 								}
-								else if (num2 < 0.87f)
+								else if (num2 < 0.82f)
 								{
+									Buy(item11, "weapon_smokegrenade");
+									Buy(item11, "weapon_flashbang");
 									Swap(item11, "weapon_usp_silencer", "weapon_p250");
 									Swap(item11, "weapon_hkp2000", "weapon_p250");
 								}
-								else if (num2 < 0.92f)
+								else if (num2 < 0.90f)
 								{
-									Swap(item11, "weapon_usp_silencer", "weapon_cz75a");
-									Swap(item11, "weapon_hkp2000", "weapon_cz75a");
+									Buy(item11, "weapon_hegrenade");
+									Buy(item11, "weapon_flashbang");
+									Swap(item11, "weapon_usp_silencer", "weapon_p250");
+									Swap(item11, "weapon_hkp2000", "weapon_p250");
 								}
-								else if (num2 < 0.96f)
+								else if (num2 < 0.95f)
+								{
+									Swap(item11, "weapon_usp_silencer", "weapon_fiveseven");
+									Swap(item11, "weapon_hkp2000", "weapon_fiveseven");
+									Buy(item11, "weapon_flashbang");
+								}
+								else
 								{
 									Swap(item11, "weapon_usp_silencer", "weapon_deagle");
 									Swap(item11, "weapon_hkp2000", "weapon_deagle");
 								}
-								else
-								{
-									Swap(item11, "weapon_usp_silencer", "weapon_fiveseven");
-									Swap(item11, "weapon_hkp2000", "weapon_fiveseven");
-								}
 							}
-							else if (num2 < 0.75f)
+							else if (num2 < 0.55f)
 							{
 								Buy(item11, "item_kevlar");
 							}
-							else if (num2 < 0.81f)
+							else if (num2 < 0.72f)
 							{
-								Swap(item11, "weapon_glock", "weapon_elite");
+								Buy(item11, "weapon_smokegrenade");
+								Buy(item11, "weapon_flashbang");
+								Buy(item11, "weapon_flashbang");
 							}
-							else if (num2 < 0.88f)
-							{
-								Swap(item11, "weapon_glock", "weapon_p250");
-							}
-							else if (num2 < 0.94f)
+							else if (num2 < 0.85f)
 							{
 								Swap(item11, "weapon_glock", "weapon_tec9");
+								Buy(item11, "weapon_flashbang");
+							}
+							else if (num2 < 0.93f)
+							{
+								Buy(item11, "weapon_smokegrenade");
+								Swap(item11, "weapon_glock", "weapon_p250");
+								Buy(item11, "weapon_flashbang");
 							}
 							else
 							{
@@ -383,7 +513,14 @@ public sealed class BotBuyPatch : BasePlugin
 							}
 							break;
 						case 10000:
+						default:
+							if (account < 3550)
+							{
+								break;
+							}
+							RefundOrStripLowTierPrimaries(item11);
 							Buy(item11, "item_assaultsuit");
+							Buy(item11, "item_kevlar");
 							if ((int)item11.Team == 3)
 							{
 								if (num2 < 0.35f)
@@ -396,8 +533,10 @@ public sealed class BotBuyPatch : BasePlugin
 								}
 								else
 								{
-									Buy(item11, "weapon_awp");
+									if (!Buy(item11, "weapon_awp"))
+										Buy(item11, "weapon_m4a1_silencer");
 								}
+								BuyDefuserIfNeeded(item11);
 							}
 							else if (num2 < 0.88f)
 							{
@@ -405,7 +544,8 @@ public sealed class BotBuyPatch : BasePlugin
 							}
 							else
 							{
-								Buy(item11, "weapon_awp");
+								if (!Buy(item11, "weapon_awp"))
+									Buy(item11, "weapon_ak47");
 							}
 							break;
 						}
@@ -446,7 +586,7 @@ public sealed class BotBuyPatch : BasePlugin
 			List<CCSPlayerController> donors = allPlayers.Where(p =>
 				(CEntityInstance)(object)p != (CEntityInstance)null && ((CEntityInstance)p).IsValid &&
 				p.Team == team && p.IsBot && p.InGameMoneyServices != null &&
-				p.InGameMoneyServices.Account >= dropThreshold && HasPrimaryWeapon(p)
+				p.InGameMoneyServices.Account >= dropThreshold && HasTier1Primary(p)
 			).OrderByDescending(p => p.InGameMoneyServices.Account).ToList();
 
 			List<CCSPlayerController> recipients = allPlayers.Where(p =>
@@ -533,17 +673,50 @@ public sealed class BotBuyPatch : BasePlugin
 			if (bot.InGameMoneyServices == null) continue;
 			int money = bot.InGameMoneyServices.Account;
 			bool hasPrimary = HasPrimaryWeapon(bot);
+			int botArmor = bot.PlayerPawn.Value?.ArmorValue ?? 0;
+			bool hasArmor = botArmor >= 50;
+			int botFullBuyThreshold = isCT ? (hasArmor ? 2900 : 3550) : (hasArmor ? 2700 : 3350);
 
-			// 1. Bot already has primary weapon (survived previous round)
+			// 1. Bot already has primary weapon (survived previous round or native buy)
 			if (hasPrimary)
 			{
 				Buy(bot, "item_assaultsuit");
 				Buy(bot, "item_kevlar");
 
+				// Upgrade low-tier primary (SMG/Scout/Galil/FAMAS) to Tier-1 Rifle/AWP when rich!
+				int upgradeThreshold = isCT ? 3900 : 3700;
+				if (!isTeamEco && !HasTier1Primary(bot) && bot.InGameMoneyServices.Account >= upgradeThreshold)
+				{
+					RefundOrStripLowTierPrimaries(bot);
+					bool upgraded = false;
+					if (awpCount == 0 && bot.InGameMoneyServices.Account >= 5400 && Random.Shared.NextSingle() < 0.30f)
+					{
+						upgraded = Buy(bot, "weapon_awp");
+						if (upgraded) awpCount++;
+					}
+					if (!upgraded)
+					{
+						if (isCT)
+						{
+							if (Random.Shared.NextSingle() < 0.65f)
+								upgraded = Buy(bot, "weapon_m4a1_silencer") || Buy(bot, "weapon_m4a1");
+							else
+								upgraded = Buy(bot, "weapon_m4a1") || Buy(bot, "weapon_m4a1_silencer");
+						}
+						else
+						{
+							upgraded = Buy(bot, "weapon_ak47");
+						}
+					}
+				}
+
 				if (isCT && bot.InGameMoneyServices.Account >= 800)
 				{
 					BuyDefuserIfNeeded(bot);
 				}
+
+				// Equip tactical grenades when armed
+				BuyTacticalGrenades(bot, isCT, isFullBuy: !isTeamEco);
 
 				if (bot.InGameMoneyServices.Account >= 4000)
 				{
@@ -578,7 +751,7 @@ public sealed class BotBuyPatch : BasePlugin
 			}
 
 			// 3. Bot can FULL BUY (Rifle + Armor)
-			if (money >= fullBuyThreshold)
+			if (money >= botFullBuyThreshold)
 			{
 				// Priority 1: Armor FIRST
 				Buy(bot, "item_assaultsuit");
@@ -600,7 +773,15 @@ public sealed class BotBuyPatch : BasePlugin
 					}
 					else
 					{
-						boughtPrimary = Buy(bot, "weapon_ak47") || Buy(bot, "weapon_galilar");
+						// In tight intermediate economy ($3400-$4100), support bots pick Galil so team affords full execute smokes!
+						if (money >= 3400 && money <= 4100 && bots.IndexOf(bot) % 2 == 1)
+						{
+							boughtPrimary = Buy(bot, "weapon_galilar") || Buy(bot, "weapon_ak47");
+						}
+						else
+						{
+							boughtPrimary = Buy(bot, "weapon_ak47") || Buy(bot, "weapon_galilar");
+						}
 					}
 				}
 
@@ -609,6 +790,9 @@ public sealed class BotBuyPatch : BasePlugin
 				{
 					BuyDefuserIfNeeded(bot);
 				}
+
+				// Priority 4: Tactical Utilities
+				BuyTacticalGrenades(bot, isCT, isFullBuy: true);
 				continue;
 			}
 
@@ -650,11 +834,124 @@ public sealed class BotBuyPatch : BasePlugin
 						boughtGun = Buy(bot, "weapon_tec9") || Buy(bot, "weapon_deagle");
 					}
 				}
+
+				if (boughtGun && bot.InGameMoneyServices.Account >= 400)
+				{
+					BuyTacticalGrenades(bot, isCT, isFullBuy: false);
+				}
 				continue;
 			}
 
 			// 5. Individual Bot broke (< minHalfBuy) when team is buying:
 			// DO NOT spend $300-$700 on a naked pistol! Spend $0 and save for next round.
+		}
+	}
+
+	private void BuyTacticalGrenades(CCSPlayerController bot, bool isCT, bool isFullBuy)
+	{
+		if ((CEntityInstance)(object)bot == (CEntityInstance)null || !((CEntityInstance)bot).IsValid || !bot.IsBot || bot.InGameMoneyServices == null)
+			return;
+		CCSPlayerPawn? pawn = bot.PlayerPawn?.Value;
+		if ((CEntityInstance)(object)pawn == (CEntityInstance)null || !((CEntityInstance)pawn).IsValid || pawn.WeaponServices == null)
+			return;
+
+		int smokeCount = 0;
+		int flashCount = 0;
+		int heCount = 0;
+		int molotovCount = 0;
+		int totalNades = 0;
+
+		foreach (var handle in pawn.WeaponServices.MyWeapons)
+		{
+			var w = handle.Value;
+			if ((CEntityInstance)(object)w == (CEntityInstance)null || !((CEntityInstance)w).IsValid) continue;
+			string d = ((CEntityInstance)w).DesignerName ?? "";
+			if (d == "weapon_smokegrenade") { smokeCount++; totalNades++; }
+			else if (d == "weapon_flashbang")
+			{
+				int fAmmo = 1;
+				byte? ammoType = w.VData?.PrimaryAmmoType;
+				if (ammoType.HasValue && ammoType.Value < 32)
+				{
+					int rawAmmo = pawn.WeaponServices.Ammo[ammoType.Value];
+					if (rawAmmo > 0) fAmmo = rawAmmo;
+				}
+				else if (w.Clip1 > 1)
+				{
+					fAmmo = w.Clip1;
+				}
+				flashCount += fAmmo;
+				totalNades += fAmmo;
+			}
+			else if (d == "weapon_hegrenade") { heCount++; totalNades++; }
+			else if (d == "weapon_molotov" || d == "weapon_incgrenade") { molotovCount++; totalNades++; }
+			else if (d == "weapon_decoy") { totalNades++; }
+		}
+
+		if (totalNades >= 4) return;
+
+		if (isFullBuy)
+		{
+			// Priority 1: Smoke ($300)
+			if (smokeCount == 0 && totalNades < 4 && bot.InGameMoneyServices.Account >= 300)
+			{
+				if (Buy(bot, "weapon_smokegrenade")) { smokeCount++; totalNades++; }
+			}
+
+			// Priority 2: Flashbang 1 ($200)
+			if (flashCount < 2 && totalNades < 4 && bot.InGameMoneyServices.Account >= 200)
+			{
+				if (Buy(bot, "weapon_flashbang")) { flashCount++; totalNades++; }
+			}
+
+			// Priority 3: Incendiary / Molotov ($500 CT / $400 T) or HE ($300)
+			if (molotovCount == 0 && heCount == 0 && totalNades < 4)
+			{
+				if (isCT)
+				{
+					if (bot.InGameMoneyServices.Account >= 500 && Buy(bot, "weapon_incgrenade"))
+					{
+						molotovCount++; totalNades++;
+					}
+					else if (bot.InGameMoneyServices.Account >= 300 && Buy(bot, "weapon_hegrenade"))
+					{
+						heCount++; totalNades++;
+					}
+				}
+				else
+				{
+					if (bot.InGameMoneyServices.Account >= 400 && Buy(bot, "weapon_molotov"))
+					{
+						molotovCount++; totalNades++;
+					}
+					else if (bot.InGameMoneyServices.Account >= 300 && Buy(bot, "weapon_hegrenade"))
+					{
+						heCount++; totalNades++;
+					}
+				}
+			}
+
+			// Priority 4: Second Flashbang ($200)
+			if (flashCount < 2 && totalNades < 4 && bot.InGameMoneyServices.Account >= 200)
+			{
+				if (Buy(bot, "weapon_flashbang")) { flashCount++; totalNades++; }
+			}
+		}
+		else
+		{
+			// Half-Buy / Force-Buy: Prioritize Smoke for T executes, then Flash
+			if (!isCT && bot.InGameMoneyServices.Account >= 300 && smokeCount == 0 && totalNades < 2)
+			{
+				if (Buy(bot, "weapon_smokegrenade")) { smokeCount++; totalNades++; }
+			}
+			if (bot.InGameMoneyServices.Account >= 200 && flashCount < 1 && totalNades < 2)
+			{
+				if (Buy(bot, "weapon_flashbang")) { flashCount++; totalNades++; }
+			}
+			if (isCT && bot.InGameMoneyServices.Account >= 300 && smokeCount == 0 && totalNades < 2)
+			{
+				if (Buy(bot, "weapon_smokegrenade")) { smokeCount++; totalNades++; }
+			}
 		}
 	}
 
@@ -687,7 +984,7 @@ public sealed class BotBuyPatch : BasePlugin
 			ConVar val2 = ConVar.Find("bot_eco_limit");
 			if (val2 != null)
 			{
-				val2.SetValue<float>(0f);
+				val2.SetValue<float>(99999f);
 			}
 		}
 		catch
@@ -706,6 +1003,32 @@ public sealed class BotBuyPatch : BasePlugin
 			}
 		}
 		return false;
+	}
+
+	private bool HasTier1Primary(CCSPlayerController player)
+	{
+		foreach (string item in Inventory(player).Weapons)
+		{
+			if (Tier1Primaries.Contains(item))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private void RefundOrStripLowTierPrimaries(CCSPlayerController player)
+	{
+		foreach (string item in Inventory(player).Weapons)
+		{
+			if (LowTierPrimaries.Contains(item))
+			{
+				if (!Refund(player, item))
+				{
+					Utilities.RemoveItemByDesignerName(player, item);
+				}
+			}
+		}
 	}
 
 	private bool Buy(CCSPlayerController player, string itemName)
@@ -743,6 +1066,26 @@ public sealed class BotBuyPatch : BasePlugin
 			break;
 		case "weapon_taser":
 			num = 200;
+			break;
+		case "weapon_smokegrenade":
+			num = 300;
+			break;
+		case "weapon_flashbang":
+			num = 200;
+			break;
+		case "weapon_hegrenade":
+			num = 300;
+			break;
+		case "weapon_molotov":
+			num = 400;
+			flag3 = flag2;
+			break;
+		case "weapon_incgrenade":
+			num = 500;
+			flag3 = flag;
+			break;
+		case "weapon_decoy":
+			num = 50;
 			break;
 		case "weapon_glock":
 			flag3 = flag2;
@@ -921,6 +1264,26 @@ public sealed class BotBuyPatch : BasePlugin
 			break;
 		case "weapon_taser":
 			num = 200;
+			break;
+		case "weapon_smokegrenade":
+			num = 300;
+			break;
+		case "weapon_flashbang":
+			num = 200;
+			break;
+		case "weapon_hegrenade":
+			num = 300;
+			break;
+		case "weapon_molotov":
+			num = 400;
+			flag4 = flag3;
+			break;
+		case "weapon_incgrenade":
+			num = 500;
+			flag4 = flag2;
+			break;
+		case "weapon_decoy":
+			num = 50;
 			break;
 		case "weapon_glock":
 			flag4 = flag3;
@@ -1108,7 +1471,7 @@ public sealed class BotBuyPatch : BasePlugin
 		{
 			CCSGameRulesProxy? obj = Utilities.FindAllEntitiesByDesignerName<CCSGameRulesProxy>("cs_gamerules").FirstOrDefault();
 			CCSGameRules val = ((obj != null) ? obj.GameRules : null);
-			if (val == null)
+			if (val == null || val.WarmupPeriod)
 			{
 				return false;
 			}
