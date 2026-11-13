@@ -29,3 +29,4 @@ echo Pode abrir o Counter-Strike 2 normalmente pela Steam e jogar!
 echo ========================================================
 echo.
 pause
+

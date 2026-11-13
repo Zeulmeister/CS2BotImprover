@@ -126,9 +126,9 @@ public class BotAimImprover : BasePlugin
     private static FieldInfo? _serverMaxPlayersField;
 
     public override string ModuleName => "BotAimImprover";
-    public override string ModuleVersion => "2.3.0";
+    public override string ModuleVersion => "2.4.0";
     public override string ModuleAuthor => "ed0ard & htfy96 & XBribo & Antigravity";
-    public override string ModuleDescription => "Restores intelligent headshot/jaw aim part selection for CS2 bots with slot-safe resolution.";
+    public override string ModuleDescription => "Tier-1 Aim Spot Selector with Velocity Lead Prediction & 3D AimPunch Recoil Compensation.";
 
     private static void ResetServerMaxPlayersCache()
     {
@@ -326,10 +326,11 @@ public class BotAimImprover : BasePlugin
 
             int chosenIdx = -1;
             float bestX = 0f, bestY = 0f, bestZ = 0f;
+            float leadTimeSec = (isEnemyOfHuman && _botChallengeMode != "easy" && _botChallengeMode != "off") ? 0.052f : 0.028f;
 
             foreach (int pointIdx in priorityList)
             {
-                if (TryComputePartPos(enemyPawn, pointIdx, out float x, out float y, out float z) &&
+                if (TryComputePartPos(enemyPawn, pointIdx, leadTimeSec, out float x, out float y, out float z) &&
                     PointVisibleFromEye(botPawn, eye, x, y, z))
                 {
                     chosenIdx = pointIdx;
@@ -343,6 +344,44 @@ public class BotAimImprover : BasePlugin
             if (chosenIdx < 0)
             {
                 return HookResult.Continue;
+            }
+
+            // Distance-scaled 3D AimPunch recoil compensation (via CS2 CCSPlayer_AimPunchServices)
+            var punchSvc = botPawn?.AimPunchServices;
+            if (punchSvc != null && shotsFired >= 2 && weaponName != "weapon_awp" && weaponName != "weapon_ssg08")
+            {
+                float punchX = (punchSvc.PredictableBaseAngle?.X ?? 0f) + (punchSvc.UnpredictableBaseAngle?.X ?? 0f);
+                float punchY = (punchSvc.PredictableBaseAngle?.Y ?? 0f) + (punchSvc.UnpredictableBaseAngle?.Y ?? 0f);
+                // If AimPunchServices hasn't accumulated pitch on this bot tick, derive conservative spray rise curve
+                if (MathF.Abs(punchX) < 0.05f && shotsFired >= 3)
+                {
+                    punchX = -Math.Clamp((shotsFired - 2) * 0.42f, 0f, 3.8f);
+                }
+
+                float dx = bestX - eye.X;
+                float dy = bestY - eye.Y;
+                float dz = bestZ - eye.Z;
+                float dist3D = MathF.Sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist3D > 60f)
+                {
+                    float recoilScale = isAllyInHardMode ? 1.10f : 1.78f;
+                    float punchPitchRad = punchX * recoilScale * (MathF.PI / 180f);
+                    float punchYawRad = punchY * recoilScale * (MathF.PI / 180f);
+
+                    float zComp = dist3D * MathF.Tan(punchPitchRad);
+                    bestZ += Math.Clamp(zComp, -95f, 25f);
+
+                    float dist2D = MathF.Sqrt(dx * dx + dy * dy);
+                    if (dist2D > 1f && MathF.Abs(punchY) > 0.01f)
+                    {
+                        float perpX = -dy / dist2D;
+                        float perpY = dx / dist2D;
+                        float horizComp = dist2D * MathF.Tan(punchYawRad);
+                        horizComp = Math.Clamp(horizComp, -38f, 38f);
+                        bestX -= perpX * horizComp;
+                        bestY -= perpY * horizComp;
+                    }
+                }
             }
 
             float* pTargetSpot = (float*)(pCCSBot + _off.TargetSpot).ToPointer();
@@ -447,7 +486,7 @@ public class BotAimImprover : BasePlugin
         return true;
     }
 
-    private static bool TryComputePartPos(CCSPlayerPawn enemyPawn, int idx, out float x, out float y, out float z)
+    private static bool TryComputePartPos(CCSPlayerPawn enemyPawn, int idx, float leadTimeSec, out float x, out float y, out float z)
     {
         x = y = z = 0f;
         if (idx < 0 || idx >= _aimPoints.Length)
@@ -467,19 +506,29 @@ public class BotAimImprover : BasePlugin
         float eyeHeight = (viewOffset != null && viewOffset.Z > 10f) ? viewOffset.Z : 64f;
         QAngle? eyeAngles = enemyPawn.EyeAngles;
         double yawRad = ((eyeAngles != null) ? eyeAngles.Y : 0f) * Math.PI / 180.0;
+        float fwdX = (float)Math.Cos(yawRad);
+        float fwdY = (float)Math.Sin(yawRad);
         float rightX = (float)Math.Sin(yawRad);
         float rightY = (float)(0.0 - Math.Cos(yawRad));
 
+        Vector? vel = enemyPawn.AbsVelocity;
+        float vx = (vel != null) ? vel.X : 0f;
+        float vy = (vel != null) ? vel.Y : 0f;
+        float speed2D = MathF.Sqrt(vx * vx + vy * vy);
+        float leadX = (speed2D > 25f && speed2D < 320f) ? vx * leadTimeSec : 0f;
+        float leadY = (speed2D > 25f && speed2D < 320f) ? vy * leadTimeSec : 0f;
+
         if (pt.FeetAbs)
         {
-            x = ox;
-            y = oy;
+            x = ox + leadX;
+            y = oy + leadY;
             z = oz + pt.Frac;
         }
         else
         {
-            x = ox + rightX * pt.Lateral;
-            y = oy + rightY * pt.Lateral;
+            float headForwardLean = (pt.Frac >= 0.88f) ? 3.2f : 1.2f;
+            x = ox + rightX * pt.Lateral + fwdX * headForwardLean + leadX;
+            y = oy + rightY * pt.Lateral + fwdY * headForwardLean + leadY;
             z = oz + eyeHeight * pt.Frac;
         }
 

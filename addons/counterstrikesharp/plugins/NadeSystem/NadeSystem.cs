@@ -1009,6 +1009,30 @@ public class NadeSystemPlugin : BasePlugin
 					return true;
 				}
 			}
+			if (num3 >= 300f && num3 <= 880f && CanTeamAffordAndAllow(bot, "flash", allControllers))
+			{
+				Vector popTarget = new Vector(
+					val.X + (absOrigin.X - val.X) * 0.45f,
+					val.Y + (absOrigin.Y - val.Y) * 0.45f,
+					val.Z + 68f);
+				if (!HasTeammateNearSpot(bot, popTarget.X, popTarget.Y, popTarget.Z, allControllers, 300f) &&
+					TrySolveBallisticArc(startPos, popTarget, allowWallBounce: true, out Vector flashOrigin, out Vector flashVelocity))
+				{
+					GrenadeData gFlash = new GrenadeData
+					{
+						Id = $"dyn_flash_{index}_{(int)currentTime}",
+						MapName = Server.MapName,
+						GrenadeType = "flash",
+						ProjectilePosition = new Vec3 { X = flashOrigin.X, Y = flashOrigin.Y, Z = flashOrigin.Z },
+						ProjectileVelocity = new Vec3 { X = flashVelocity.X, Y = flashVelocity.Y, Z = flashVelocity.Z },
+						LandingPosition = new Vec3 { X = popTarget.X, Y = popTarget.Y, Z = popTarget.Z },
+						Description = "DynamicPopFlash"
+					};
+					_dynamicNadeCooldownByBot[index] = currentTime + 10f;
+					TryReplay(bot, gFlash, allControllers);
+					return true;
+				}
+			}
 			if (!(num3 >= 380f) || !(num3 <= 1050f))
 			{
 				continue;
@@ -2788,6 +2812,66 @@ public class NadeSystemPlugin : BasePlugin
 					_defuseFlashUsed = true;
 					_botFlashImmunityUntil[((CEntityInstance)userid).Index] = Server.CurrentTime + 2f;
 					TrySpawnInstantGrenade(userid, spawnPos, "flash", new Vector((float?)0f, (float?)0f, (float?)(-800f)));
+				}
+			}
+		}
+
+		// Anti-Defuse Molotov/HE by Terrorist bots upon hearing C4 defuse sound
+		if (_botNadesMode != "off" && !_roundOver && (CEntityInstance)(object)userid != (CEntityInstance)null && ((CEntityInstance)userid).IsValid)
+		{
+			CCSPlayerPawn? defPawn = userid.PlayerPawn?.Value;
+			Vector? defPos = defPawn?.AbsOrigin;
+			if (defPos != null)
+			{
+				Vector targetSpot = new Vector(defPos.X, defPos.Y, defPos.Z + 18f);
+				float now = Server.CurrentTime;
+				for (int s = 0; s < 64; s++)
+				{
+					CCSPlayerController? tBot = Utilities.GetPlayerFromSlot(s);
+					if (tBot == null || !tBot.IsValid || !tBot.IsBot || !tBot.PawnIsAlive || tBot.TeamNum != 2 || tBot.HasBeenControlledByPlayerThisRound)
+						continue;
+					CCSPlayerPawn? tPawn = tBot.PlayerPawn?.Value;
+					if (tPawn == null || !tPawn.IsValid || tPawn.AbsOrigin == null)
+						continue;
+					if (tPawn.Bot != null && tPawn.Bot.IsEnemyVisible)
+						continue;
+					if (tBot.Slot >= 0 && _activeWindups.ContainsKey(tBot.Slot))
+						continue;
+					float dist = Dist3D(tPawn.AbsOrigin.X, tPawn.AbsOrigin.Y, tPawn.AbsOrigin.Z, defPos.X, defPos.Y, defPos.Z);
+					if (dist < 320f || dist > 1150f)
+						continue;
+
+					string nadeType = "";
+					string wName = "";
+					int itemDef = 0;
+					if (HasGrenadeInInventory(tPawn, "molotov", out wName, out itemDef))
+					{
+						nadeType = "molotov";
+					}
+					else if (HasGrenadeInInventory(tPawn, "he", out wName, out itemDef))
+					{
+						nadeType = "he";
+					}
+					if (string.IsNullOrEmpty(nadeType))
+						continue;
+
+					Vector tEye = new Vector(tPawn.AbsOrigin.X, tPawn.AbsOrigin.Y, tPawn.AbsOrigin.Z + (tPawn.ViewOffset?.Z ?? 64f));
+					if (TrySolveBallisticArc(tEye, targetSpot, allowWallBounce: true, out Vector lOrig, out Vector lVel))
+					{
+						GrenadeData antiDefuseNade = new GrenadeData
+						{
+							Id = $"antidefuse_{nadeType}_{tBot.Index}_{(int)now}",
+							MapName = Server.MapName,
+							GrenadeType = nadeType,
+							ProjectilePosition = new Vec3 { X = lOrig.X, Y = lOrig.Y, Z = lOrig.Z },
+							ProjectileVelocity = new Vec3 { X = lVel.X, Y = lVel.Y, Z = lVel.Z },
+							LandingPosition = new Vec3 { X = targetSpot.X, Y = targetSpot.Y, Z = targetSpot.Z },
+							Description = "AntiDefuseUtility"
+						};
+						_dynamicNadeCooldownByBot[tBot.Index] = now + 10f;
+						ExecuteRealisticThrow(tBot, antiDefuseNade, wName, itemDef);
+						break;
+					}
 				}
 			}
 		}

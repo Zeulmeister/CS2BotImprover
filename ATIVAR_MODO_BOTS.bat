@@ -29,3 +29,4 @@ echo Pode abrir o CS2 e entrar na partida (Pratica ou console)!
 echo ========================================================
 echo.
 pause
+

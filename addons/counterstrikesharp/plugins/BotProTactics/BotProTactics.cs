@@ -165,10 +165,17 @@ namespace BotProTactics
 
         // Weapon & economy snapshot
         public WeaponClass EquippedClass = WeaponClass.Rifle;
+        public string ActiveWeaponName = "";
         public int PrimaryDefIndex = -1;
         public int SecondaryDefIndex = -1;
         public int Clip1 = 30;
         public int Money = 800;
+
+        // Post-visibility pre-fire suppression memory
+        public float LastEnemySeenSec = -99f;
+        public float LastEnemySeenX;
+        public float LastEnemySeenY;
+        public float LastEnemySeenZ;
 
         public void ResetForRound(int slot)
         {
@@ -202,19 +209,24 @@ namespace BotProTactics
             CanStrafeRight = true;
             CanMoveBack = true;
             HasCorridorPreAim = false;
+            ActiveWeaponName = "";
             PrimaryDefIndex = -1;
             SecondaryDefIndex = -1;
+            LastEnemySeenSec = -99f;
+            LastEnemySeenX = 0f;
+            LastEnemySeenY = 0f;
+            LastEnemySeenZ = 0f;
         }
     }
 
     // =========================================================================
-    // 2. MAIN PLUGIN: BOTPROTATICS v3.3.0 (UTILITY AI + RAYTRACE SUBTICK ENGINE)
+    // 2. MAIN PLUGIN: BOTPROTATICS v3.5.0 (UTILITY AI + RAYTRACE SUBTICK ENGINE)
     // =========================================================================
 
     public class BotProTacticsPlugin : BasePlugin
     {
         public override string ModuleName => "BotProTactics";
-        public override string ModuleVersion => "3.3.0";
+        public override string ModuleVersion => "3.5.0";
         public override string ModuleAuthor => "Antigravity & ed0ard";
         public override string ModuleDescription => "Tier 1 Utility AI + HFSM, Slot64 Scan, Planted Burst Discipline & Biomechanical Aim";
 
@@ -1650,11 +1662,45 @@ namespace BotProTactics
 
                 if (!ctx.IsAnchoredOnSightline && speed2D < 28.0f && !nearSpawn && (nowSec - _freezeEndTime >= 8.0f))
                 {
+                    float desiredAnchorYaw = eyeAngles.Y;
                     float fwdDepth = MeasureRayDistance(rayTrace, botOrigin.X, botOrigin.Y, eyeZ, fwdX, fwdY, 950.0f);
                     if (fwdDepth >= 560.0f)
                     {
+                        // Crossfire Diversity Check: if an anchored teammate within 450u already holds this same yaw (< 28 deg), shift to secondary angle!
+                        bool duplicateAngle = false;
+                        for (int s = 0; s < 64; s++)
+                        {
+                            if (s == ctx.Slot || !_agents[s].IsAnchoredOnSightline) continue;
+                            var ally = Utilities.GetPlayerFromSlot(s);
+                            var allyPawn = ally?.PlayerPawn?.Value;
+                            if (ally == null || !ally.IsValid || !ally.PawnIsAlive || ally.TeamNum != pawn.TeamNum || allyPawn?.AbsOrigin == null)
+                                continue;
+                            if (Dist2D(botOrigin.X, botOrigin.Y, allyPawn.AbsOrigin.X, allyPawn.AbsOrigin.Y) < 450.0f &&
+                                MathF.Abs(NormalizeAngle(_agents[s].AnchoredYaw - desiredAnchorYaw)) < 28.0f)
+                            {
+                                duplicateAngle = true;
+                                break;
+                            }
+                        }
+
+                        if (duplicateAngle)
+                        {
+                            float yawLeft = NormalizeAngle(desiredAnchorYaw + 55.0f);
+                            float yawRight = NormalizeAngle(desiredAnchorYaw - 55.0f);
+                            float dLeft = MeasureYawDistance(rayTrace, botOrigin.X, botOrigin.Y, eyeZ, yawLeft, 850.0f);
+                            float dRight = MeasureYawDistance(rayTrace, botOrigin.X, botOrigin.Y, eyeZ, yawRight, 850.0f);
+                            if (dLeft >= 380.0f && dLeft >= dRight)
+                            {
+                                desiredAnchorYaw = yawLeft;
+                            }
+                            else if (dRight >= 380.0f)
+                            {
+                                desiredAnchorYaw = yawRight;
+                            }
+                        }
+
                         ctx.IsAnchoredOnSightline = true;
-                        ctx.AnchoredYaw = eyeAngles.Y;
+                        ctx.AnchoredYaw = desiredAnchorYaw;
                     }
                 }
                 else if (ctx.IsAnchoredOnSightline && (speed2D > 38.0f || nearSpawn || (nowSec - _freezeEndTime < 8.0f)))
@@ -1769,6 +1815,39 @@ namespace BotProTactics
         // 8. STATE MOVEMENT & SUBTICK COUNTER-STRAFE EXECUTION
         // =========================================================================
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static ulong ComputeCounterStrafeButtons(CCSPlayerPawn pawn, int fallbackStrafeDir)
+        {
+            Vector? vel = pawn.AbsVelocity;
+            QAngle? eye = pawn.EyeAngles;
+            if (vel == null || eye == null)
+            {
+                return (fallbackStrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
+            }
+
+            float yawRad = eye.Y * (MathF.PI / 180.0f);
+            float fwdX = MathF.Cos(yawRad);
+            float fwdY = MathF.Sin(yawRad);
+            float rightX = MathF.Sin(yawRad);
+            float rightY = -MathF.Cos(yawRad);
+
+            float fwdSpeed = vel.X * fwdX + vel.Y * fwdY;
+            float rightSpeed = vel.X * rightX + vel.Y * rightY;
+
+            ulong mask = 0UL;
+            if (fwdSpeed > 34.0f) mask |= IN_BACK;
+            else if (fwdSpeed < -34.0f) mask |= IN_FORWARD;
+
+            if (rightSpeed > 34.0f) mask |= IN_MOVELEFT;
+            else if (rightSpeed < -34.0f) mask |= IN_MOVERIGHT;
+
+            if (mask == 0UL)
+            {
+                mask = (fallbackStrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
+            }
+            return mask;
+        }
+
         private void ExecuteTacticalStateMovement(
             IBotControllerApi api,
             CCSPlayerController bot,
@@ -1839,7 +1918,62 @@ namespace BotProTactics
                     return;
                 }
 
-                // Long Range (> 1100u): Entry Counter-Strafe (0..45ms) -> Planted 2-3 Tap Window (280ms) -> Short Micro-Strafe (115ms)
+                // Deagle & Scout precision cadence (> 360u): strict stationary stop + paced reset window
+                bool isDeagleOrScout = (ctx.ActiveWeaponName == "weapon_deagle" || ctx.ActiveWeaponName == "weapon_ssg08");
+                if (EnableDistanceCombatDiscipline && isDeagleOrScout && dist > 360.0f)
+                {
+                    if (ccsBot != null)
+                    {
+                        ccsBot.IsRapidFiring = false;
+                    }
+                    if (ctx.CombatPhase == 0)
+                    {
+                        if (speed2D > 34.0f && elapsed < 65)
+                        {
+                            ulong counterBtn = ComputeCounterStrafeButtons(pawn, ctx.StrafeDir);
+                            api.InjectUsercmd(slot, counterBtn, 32);
+                        }
+                        else
+                        {
+                            ctx.CombatPhase = 1;
+                            ctx.PhaseStartMs = nowMs;
+                            ctx.SprayTicks = 0;
+                            if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
+                        }
+                    }
+                    else if (ctx.CombatPhase == 1)
+                    {
+                        if (ccsBot != null)
+                        {
+                            ccsBot.ForwardSpeed = 0f;
+                            ccsBot.LeftSpeed = 0f;
+                            if (nowMs - ctx.LastShotFiredMs < 360)
+                            {
+                                ccsBot.FireWeaponTimestamp = nowSec + 0.12f;
+                            }
+                        }
+                        if (pawn.AbsVelocity != null && speed2D > 34.0f) { pawn.AbsVelocity.X *= 0.45f; pawn.AbsVelocity.Y *= 0.45f; }
+                        if (elapsed >= 260)
+                        {
+                            ctx.StrafeDir = PickNextStrafeDirection(ctx);
+                            ctx.CombatPhase = 2;
+                            ctx.PhaseStartMs = nowMs;
+                        }
+                    }
+                    else
+                    {
+                        ulong moveBtn = (ctx.StrafeDir > 0) ? IN_MOVERIGHT : IN_MOVELEFT;
+                        api.InjectUsercmd(slot, moveBtn, 42);
+                        if (elapsed >= 140)
+                        {
+                            ctx.CombatPhase = 0;
+                            ctx.PhaseStartMs = nowMs;
+                        }
+                    }
+                    return;
+                }
+
+                // Long Range (> 1100u): Entry 2D Vector Counter-Strafe (0..55ms) -> Planted 2-3 Tap Window (280ms) -> Short Micro-Strafe (115ms)
                 if (EnableDistanceCombatDiscipline && dist > 1100.0f)
                 {
                     if (ccsBot != null)
@@ -1848,10 +1982,10 @@ namespace BotProTactics
                     }
                     if (ctx.CombatPhase == 0)
                     {
-                        if (speed2D > 65.0f && elapsed < 45)
+                        if (speed2D > 34.0f && elapsed < 55)
                         {
-                            ulong counterBtn = (ctx.StrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
-                            api.InjectUsercmd(slot, counterBtn, 38);
+                            ulong counterBtn = ComputeCounterStrafeButtons(pawn, ctx.StrafeDir);
+                            api.InjectUsercmd(slot, counterBtn, 32);
                         }
                         else
                         {
@@ -1865,7 +1999,7 @@ namespace BotProTactics
                     {
                         // Planted Accurate Tap/Burst Window (280ms): zero lateral movement!
                         if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
-                        if (pawn.AbsVelocity != null && speed2D > 45.0f) { pawn.AbsVelocity.X *= 0.5f; pawn.AbsVelocity.Y *= 0.5f; }
+                        if (pawn.AbsVelocity != null && speed2D > 34.0f) { pawn.AbsVelocity.X *= 0.45f; pawn.AbsVelocity.Y *= 0.45f; }
                         if (elapsed >= 280)
                         {
                             ctx.StrafeDir = PickNextStrafeDirection(ctx);
@@ -1887,18 +2021,18 @@ namespace BotProTactics
                     return;
                 }
 
-                // Mid Range (320 - 1100u): Entry Subtick Counter-Strafe -> Planted Accurate Burst -> Micro-Strafe (120ms)
+                // Mid Range (320 - 1100u): Entry 2D Vector Counter-Strafe -> Planted Accurate Burst + Donk Crouch-Weave -> Micro-Strafe (120ms)
                 bool isAllyInHardMode = (_botChallengeMode == "hard" && _cachedHumanTeam != CsTeam.None && bot.Team == _cachedHumanTeam);
-                int phase0BrakeMs = isAllyInHardMode ? 90 : 45;
-                int plantedBurstMs = isAllyInHardMode ? 310 : 435;
+                int phase0BrakeMs = isAllyInHardMode ? 90 : 55;
+                int plantedBurstMs = isAllyInHardMode ? 310 : 440;
 
                 if (ctx.CombatPhase == 0)
                 {
-                    // Phase 0: Immediate Subtick Brake if moving > 65 u/s upon entering duel or finishing micro-strafe
-                    if (speed2D > 65.0f && elapsed < phase0BrakeMs)
+                    // Phase 0: Immediate 2D Vector Brake if moving > 34 u/s upon entering duel or finishing micro-strafe
+                    if (speed2D > 34.0f && elapsed < phase0BrakeMs)
                     {
-                        ulong counterBtn = (ctx.StrafeDir > 0) ? IN_MOVELEFT : IN_MOVERIGHT;
-                        api.InjectUsercmd(slot, counterBtn, 38);
+                        ulong counterBtn = ComputeCounterStrafeButtons(pawn, ctx.StrafeDir);
+                        api.InjectUsercmd(slot, counterBtn, 32);
                     }
                     else
                     {
@@ -1911,14 +2045,25 @@ namespace BotProTactics
                 }
                 else if (ctx.CombatPhase == 1)
                 {
-                    // Phase 1: Planted 5-7 Bullet Accurate Burst Window
+                    // Phase 1: Planted 5-7 Bullet Accurate Burst Window + Donk Crouch-Weave
                     if (ccsBot != null) { ccsBot.ForwardSpeed = 0f; ccsBot.LeftSpeed = 0f; }
-                    if (pawn.AbsVelocity != null && speed2D > 45.0f) { pawn.AbsVelocity.X *= 0.5f; pawn.AbsVelocity.Y *= 0.5f; }
+                    if (pawn.AbsVelocity != null && speed2D > 34.0f) { pawn.AbsVelocity.X *= 0.45f; pawn.AbsVelocity.Y *= 0.45f; }
 
-                    if (dist < 680.0f && ctx.SprayTicks >= 3 && !ctx.DidCrouchTap && hasDirectEnemyInSight)
+                    if (dist < 780.0f && ctx.SprayTicks >= 2 && hasDirectEnemyInSight && !isAllyInHardMode)
                     {
-                        api.InjectUsercmd(slot, IN_DUCK, 180);
-                        ctx.DidCrouchTap = true;
+                        if (elapsed >= 90 && elapsed < 260)
+                        {
+                            api.InjectUsercmd(slot, IN_DUCK, 60);
+                        }
+                        else if (elapsed >= 260 && elapsed < 360)
+                        {
+                            ulong weaveBtn = (ctx.StrafeDir > 0) ? IN_MOVERIGHT : IN_MOVELEFT;
+                            api.InjectUsercmd(slot, weaveBtn, 35);
+                        }
+                        else if (elapsed >= 360)
+                        {
+                            api.InjectUsercmd(slot, IN_DUCK, 90);
+                        }
                     }
 
                     if (elapsed >= plantedBurstMs)
@@ -2033,13 +2178,17 @@ namespace BotProTactics
             Vector? moveVel = pawn.AbsVelocity;
             float speed2D = (moveVel != null) ? MathF.Sqrt(moveVel.X * moveVel.X + moveVel.Y * moveVel.Y) : 0f;
 
-            // CASE 1: Direct Enemy Visible -> Unlock native aim immediately & record visual threat
+            // CASE 1: Direct Enemy Visible -> Unlock native aim immediately & record visual threat + post-los memory
             // (Let native CCSBot::UpdateLookAngles + BotAimImprover PickNewAimSpot drive exact head/chest target without conflicting pitch oscillation!)
             if (hasDirectEnemyInSight && ccsBot != null)
             {
                 ccsBot.InhibitLookAroundTimestamp = 0f;
+                ctx.LastEnemySeenSec = nowSec;
                 if (ccsBot.LastEnemyPosition != null)
                 {
+                    ctx.LastEnemySeenX = ccsBot.LastEnemyPosition.X;
+                    ctx.LastEnemySeenY = ccsBot.LastEnemyPosition.Y;
+                    ctx.LastEnemySeenZ = ccsBot.LastEnemyPosition.Z;
                     ctx.Threat.Set(ccsBot.LastEnemyPosition, nowSec + 2.10f, ThreatType.VisualSight, 1.50f);
                 }
                 return;
@@ -2049,6 +2198,29 @@ namespace BotProTactics
             if (ccsBot?.IsAvoidingGrenade != null && nowSec < ccsBot.IsAvoidingGrenade.Timestamp)
             {
                 return;
+            }
+
+            // CASE 1.5: Pre-Fire Re-Peek Corner Suppression (holds edge for 850ms after enemy ducks into cover)
+            float sinceLastSeen = nowSec - ctx.LastEnemySeenSec;
+            if (sinceLastSeen >= 0f && sinceLastSeen <= 0.85f && ctx.Clip1 > 3 && ctx.EquippedClass >= WeaponClass.SmgOrShotgun)
+            {
+                float viewZ = pawn.ViewOffset?.Z ?? 64.0f;
+                float sdx = ctx.LastEnemySeenX - botOrigin.X;
+                float sdy = ctx.LastEnemySeenY - botOrigin.Y;
+                float sdz = (ctx.LastEnemySeenZ + 61.5f) - (botOrigin.Z + viewZ);
+                float sDist2D = MathF.Sqrt(sdx * sdx + sdy * sdy);
+                if (sDist2D > 40.0f && sDist2D < 1200.0f)
+                {
+                    float supYaw = MathF.Atan2(sdy, sdx) * (180.0f / MathF.PI);
+                    float supPitch = Math.Clamp(-MathF.Atan2(sdz, sDist2D) * (180.0f / MathF.PI), -52.0f, 52.0f);
+                    ApplySmoothHumanAim(pawn, ccsBot, eyeAngles, supYaw, supPitch, 460.0f, 4.2f, dt, nowSec);
+
+                    if (sinceLastSeen <= 0.35f && speed2D < 38.0f && nowMs - ctx.LastShotFiredMs >= 260)
+                    {
+                        GetApi()?.InjectUsercmd(ctx.Slot, IN_ATTACK, 85);
+                    }
+                    return;
+                }
             }
 
             // CASE 2: Tactical Threat Memory & Team Callout Facing (Head-height pre-aim Z + 61.5u)
@@ -2682,6 +2854,7 @@ namespace BotProTactics
             {
                 ctx.Clip1 = activeWeapon.Clip1;
                 string name = (activeWeapon.DesignerName ?? "").ToLowerInvariant();
+                ctx.ActiveWeaponName = name;
                 if (name.Contains("awp") || name.Contains("ssg08") || name.Contains("scar20") || name.Contains("g3sg1"))
                     ctx.EquippedClass = WeaponClass.Sniper;
                 else if (name.Contains("ak47") || name.Contains("m4a1") || name.Contains("galil") || name.Contains("famas") || name.Contains("aug") || name.Contains("sg556"))

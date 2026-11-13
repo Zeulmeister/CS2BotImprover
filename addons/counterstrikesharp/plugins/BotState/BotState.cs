@@ -118,6 +118,8 @@ public class BotState : BasePlugin
     // Cached bot controllers updated every 4 ticks to avoid per-tick entity enumeration
     private readonly List<CCSPlayerController> _cachedControllers = new List<CCSPlayerController>(16);
     private readonly List<CCSPlayerController> _cachedAllPlayers = new List<CCSPlayerController>(16);
+    private readonly List<CBasePlayerWeapon> _trackedTier3Weapons = new List<CBasePlayerWeapon>(32);
+    private readonly Dictionary<int, float> _scavengeCooldownUntil = new Dictionary<int, float>();
     private int _tickCounter;
     private static FieldInfo? _serverMaxPlayersField;
 
@@ -147,9 +149,9 @@ public class BotState : BasePlugin
     }
 
     public override string ModuleName => "Smarter-Bot";
-    public override string ModuleVersion => "2.2.0";
+    public override string ModuleVersion => "2.3.0";
     public override string ModuleAuthor => "Antigravity, ed0ard & XBribo";
-    public override string ModuleDescription => "Synchronized with BotProTactics: Zero-GC Flash Dodge with Yaw Restore, 8-Way RayTrace Unstuck & Reload Cancel";
+    public override string ModuleDescription => "Synchronized with BotProTactics: Zero-GC Flash Dodge, Acoustic Reload Cancel, Tier-1 Weapon Scavenging & Anti-Stuck";
 
     public override void Load(bool hotReload)
     {
@@ -213,19 +215,34 @@ public class BotState : BasePlugin
         }
     }
 
+    private static bool IsTier3PrimaryName(string? name)
+    {
+        return name == "weapon_ak47" || name == "weapon_m4a1_silencer" || name == "weapon_m4a1" ||
+               name == "weapon_awp" || name == "weapon_aug" || name == "weapon_sg556";
+    }
+
     private void OnEntitySpawned(CEntityInstance entity)
     {
         if (entity == null || !entity.IsValid)
         {
             return;
         }
-        if (entity.DesignerName == "flashbang_projectile")
+        string dName = entity.DesignerName ?? "";
+        if (dName == "flashbang_projectile")
         {
             CBaseEntity baseEnt = entity.As<CBaseEntity>();
             if (baseEnt != null && baseEnt.IsValid)
             {
                 _activeFlashEntities.Add(baseEnt);
                 _flashThrownAt[entity.Index] = Server.CurrentTime;
+            }
+        }
+        else if (IsTier3PrimaryName(dName))
+        {
+            CBasePlayerWeapon wep = entity.As<CBasePlayerWeapon>();
+            if (wep != null && wep.IsValid)
+            {
+                _trackedTier3Weapons.Add(wep);
             }
         }
     }
@@ -369,6 +386,7 @@ public class BotState : BasePlugin
         if (_tickCounter % 4 == 0 || _cachedControllers.Count == 0)
         {
             PopulateConnectedPlayers(_cachedControllers, botsOnly: true);
+            PopulateConnectedPlayers(_cachedAllPlayers, botsOnly: false);
         }
         _tickCounter++;
     }
@@ -402,6 +420,11 @@ public class BotState : BasePlugin
 
             int index = (int)item.Index;
             InterruptReload(item, pawn, bot, currentTime);
+
+            if ((_tickCounter + item.Slot) % 32 == 0)
+            {
+                TryScavengeDroppedWeapon(item, pawn, bot, currentTime);
+            }
 
             // Keep core alertness & responsiveness active without overriding BotProTactics fire cadence or movement physics
             bot.IsSleeping = false;
@@ -601,10 +624,12 @@ public class BotState : BasePlugin
         _idleStartTime.Clear();
         _lastRepathTime.Clear();
         _reloadInterruptCooldown.Clear();
+        _scavengeCooldownUntil.Clear();
         _activeFlashEntities.Clear();
         _flashThrownAt.Clear();
         _flashRolledByBot.Clear();
         _flashDecisions.Clear();
+        _trackedTier3Weapons.Clear();
         PopulateConnectedPlayers(_cachedControllers, botsOnly: true);
         Logger.LogInformation("[BotState] Round Start - {BotCount} bots active, state caches and anti-stuck tracking reset.", _cachedControllers.Count);
         return HookResult.Continue;
@@ -799,9 +824,121 @@ public class BotState : BasePlugin
         }
     }
 
+    private bool IsEnemyAudibleOrClose(CCSPlayerController botCtrl, CCSPlayerPawn botPawn, float radius)
+    {
+        Vector? botPos = botPawn.AbsOrigin;
+        if (botPos == null) return false;
+        float rSq = radius * radius;
+        for (int i = 0; i < _cachedAllPlayers.Count; i++)
+        {
+            CCSPlayerController other = _cachedAllPlayers[i];
+            if (other == null || !other.IsValid || !other.PawnIsAlive || other.TeamNum == botCtrl.TeamNum)
+                continue;
+            if (other.TeamNum != 2 && other.TeamNum != 3)
+                continue;
+            CCSPlayerPawn? oPawn = other.PlayerPawn?.Value;
+            Vector? oPos = oPawn?.AbsOrigin;
+            if (oPawn == null || !oPawn.IsValid || oPos == null)
+                continue;
+            float dx = oPos.X - botPos.X;
+            float dy = oPos.Y - botPos.Y;
+            float dz = oPos.Z - botPos.Z;
+            if (dx * dx + dy * dy + dz * dz > rSq)
+                continue;
+            Vector? oVel = oPawn.AbsVelocity;
+            float spd2D = (oVel != null) ? MathF.Sqrt(oVel.X * oVel.X + oVel.Y * oVel.Y) : 0f;
+            if (spd2D > 130f || (oPawn.ShotsFired > 0))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void TryScavengeDroppedWeapon(CCSPlayerController botCtrl, CCSPlayerPawn pawn, CCSBot bot, float now)
+    {
+        if (_botController == null || _isFreezeTime || bot.IsEnemyVisible || bot.IsAttacking || pawn.IsDefusing)
+            return;
+        if (_trackedTier3Weapons.Count == 0 || pawn.AbsOrigin == null)
+            return;
+
+        int slot = botCtrl.Slot;
+        if (_scavengeCooldownUntil.TryGetValue(slot, out float cdUntil) && now < cdUntil)
+            return;
+
+        var myWeapons = pawn.WeaponServices?.MyWeapons;
+        if (myWeapons == null)
+            return;
+
+        bool alreadyHasTier3 = false;
+        foreach (CHandle<CBasePlayerWeapon> handle in myWeapons)
+        {
+            CBasePlayerWeapon? w = handle.Value;
+            if (w == null || !w.IsValid) continue;
+            if (IsTier3PrimaryName(w.DesignerName))
+            {
+                alreadyHasTier3 = true;
+                break;
+            }
+        }
+        if (alreadyHasTier3)
+            return;
+
+        Vector botPos = pawn.AbsOrigin;
+        float bestDistSq = 115f * 115f;
+        CBasePlayerWeapon? bestWep = null;
+        Vector? bestWepPos = null;
+
+        for (int i = _trackedTier3Weapons.Count - 1; i >= 0; i--)
+        {
+            CBasePlayerWeapon wep = _trackedTier3Weapons[i];
+            if (wep == null || !wep.IsValid)
+            {
+                _trackedTier3Weapons.RemoveAt(i);
+                continue;
+            }
+            if (wep.OwnerEntity.Value != null || wep.Clip1 <= 0)
+                continue;
+            Vector? wPos = wep.AbsOrigin;
+            if (wPos == null)
+                continue;
+            float dx = wPos.X - botPos.X;
+            float dy = wPos.Y - botPos.Y;
+            float dz = wPos.Z - botPos.Z;
+            if (MathF.Abs(dz) > 64f)
+                continue;
+            float dSq = dx * dx + dy * dy + dz * dz;
+            if (dSq < bestDistSq)
+            {
+                bestDistSq = dSq;
+                bestWep = wep;
+                bestWepPos = wPos;
+            }
+        }
+
+        if (bestWep != null && bestWepPos != null)
+        {
+            float dx = bestWepPos.X - botPos.X;
+            float dy = bestWepPos.Y - botPos.Y;
+            float dz = bestWepPos.Z - (botPos.Z + (pawn.ViewOffset?.Z ?? 64f));
+            float hDist = MathF.Sqrt(dx * dx + dy * dy);
+            float yaw = MathF.Atan2(dy, dx) * (180f / MathF.PI);
+            float pitch = Math.Clamp(-MathF.Atan2(dz, MathF.Max(hDist, 1f)) * (180f / MathF.PI), -52f, 52f);
+            if (pawn.EyeAngles != null) { pawn.EyeAngles.Y = yaw; pawn.EyeAngles.X = pitch; }
+            if (pawn.V_angle != null) { pawn.V_angle.Y = yaw; pawn.V_angle.X = pitch; }
+            BotControllerBridge.InjectUsercmd(_botController, slot, 32UL, 120);
+            _scavengeCooldownUntil[slot] = now + 2.0f;
+        }
+    }
+
     private void InterruptReload(CCSPlayerController player, CCSPlayerPawn pawn, CCSBot bot, float now)
     {
-        if (_botController == null || !bot.IsEnemyVisible || !IsReloading(player))
+        if (_botController == null || !IsReloading(player))
+        {
+            return;
+        }
+        bool danger = bot.IsEnemyVisible || IsEnemyAudibleOrClose(player, pawn, 480f);
+        if (!danger)
         {
             return;
         }
